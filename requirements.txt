@@ -1,0 +1,7 @@
+streamlit>=1.50
+xarray
+cfgrib
+eccodes
+pandas
+numpy
+openpyxl
