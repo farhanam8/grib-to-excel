@@ -1,5 +1,7 @@
 streamlit>=1.60
 eccodes
+xarray
+netCDF4
 pandas
 numpy
 openpyxl

@@ -1,8 +1,9 @@
 """
-GRIB ke Excel
-=============
-Aplikasi kecil untuk mengubah file GRIB (ERA5, ERA5-Land, dan sejenisnya)
-menjadi file Excel pada satu titik lokasi.
+Analisis Titik ERA5
+===================
+Aplikasi untuk mengolah data ERA5, ERA5-Land, dan sejenisnya pada satu titik
+lokasi. Masukan: file GRIB, NetCDF (.nc), atau ZIP unduhan CDS. Keluaran:
+tabel Excel, grafik deret waktu, windrose, dan windrose di atas peta.
 
 Cara jalan:
     pip install -r requirements.txt
@@ -10,8 +11,8 @@ Cara jalan:
 
 Alur:
     1. Pengguna memasukkan koordinat (lintang, bujur).
-    2. Aplikasi mencari titik grid terdekat untuk setiap bentuk grid di file GRIB,
-       lalu membaca nilai di titik itu saja dari setiap message (via ecCodes).
+    2. Aplikasi mencari titik grid terdekat. GRIB dibaca per message (jalur cepat
+       untuk GRIB1 ERA5, ecCodes untuk format lain); NetCDF dibaca lewat xarray.
     3. Variabel mentah diterjemahkan ke besaran yang mudah dibaca,
        misalnya u10 + v10 menjadi kecepatan dan arah angin.
     4. Grafik deret waktu (resolusi otomatis) dan windrose untuk data angin.
@@ -36,6 +37,8 @@ R_BUMI_KM = 6371.0088
 NAMA_ARAH = ["Utara", "Timur Laut", "Timur", "Tenggara",
              "Selatan", "Barat Daya", "Barat", "Barat Laut"]
 ZONA_WAKTU = {"UTC": 0, "WIB (UTC+7)": 7, "WITA (UTC+8)": 8, "WIT (UTC+9)": 9}
+JUDUL_APLIKASI = "Analisis Titik ERA5"
+EKSTENSI_MASUKAN = ["grib", "grb", "grib1", "grib2", "grb2", "nc", "nc4", "netcdf", "zip"]
 
 # --------------------------------------------------------------------------
 # Kamus terjemahan variabel
@@ -489,6 +492,209 @@ def baca_titik_grib(path, nama_tampil, lat, lon, lewati_kosong=True, kabar=None)
 
 
 # --------------------------------------------------------------------------
+# Membaca NetCDF (ERA5 dari CDS, format lama maupun baru)
+# --------------------------------------------------------------------------
+NAMA_LINTANG = ("latitude", "lat")
+NAMA_BUJUR = ("longitude", "lon")
+NAMA_WAKTU = ("valid_time", "time")
+NAMA_LEVEL = {"pressure_level": "{:g} hPa", "level": "{:g} hPa", "isobaricInhPa": "{:g} hPa",
+              "depthBelowLandLayer": "kedalaman {:g} m", "model_level": "model level {:g}"}
+
+
+def jenis_file(path: str) -> str:
+    """Tebak format dari beberapa byte pertama: 'grib', 'nc', 'zip', atau 'lain'."""
+    with open(path, "rb") as f:
+        kepala = f.read(2048)
+    if kepala[:4] == b"PK\x03\x04":
+        return "zip"
+    if kepala[:3] == b"CDF" or kepala[:8] == b"\x89HDF\r\n\x1a\n":
+        return "nc"
+    if b"GRIB" in kepala:
+        return "grib"
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".nc", ".nc4", ".netcdf", ".cdf"):
+        return "nc"
+    if ext in (".grib", ".grb", ".grib1", ".grib2", ".grb2"):
+        return "grib"
+    return "lain"
+
+
+def buka_zip(path: str, nama_tampil: str, folder: str):
+    """Ekstrak file GRIB/NetCDF dari ZIP unduhan CDS. Mengembalikan list (path, nama)."""
+    import zipfile
+    hasil = []
+    with zipfile.ZipFile(path) as z:
+        for info in z.infolist():
+            if info.is_dir() or os.path.basename(info.filename).startswith("."):
+                continue
+            tujuan = os.path.join(folder, f"{len(hasil)}_{os.path.basename(info.filename)}")
+            with z.open(info) as sumber, open(tujuan, "wb") as keluar:
+                while True:
+                    blok = sumber.read(1 << 20)
+                    if not blok:
+                        break
+                    keluar.write(blok)
+            if jenis_file(tujuan) in ("grib", "nc"):
+                hasil.append((tujuan, f"{nama_tampil}/{os.path.basename(info.filename)}"))
+            else:
+                os.remove(tujuan)
+    if not hasil:
+        raise ValueError(f"{nama_tampil}: tidak ada file GRIB atau NetCDF di dalam ZIP.")
+    return hasil
+
+
+def _cari_nama(ds, kandidat):
+    for n in kandidat:
+        if n in ds.dims or n in ds.coords:
+            return n
+    return None
+
+
+def baca_titik_nc(path, nama_tampil, lat, lon, lewati_kosong=True, kabar=None):
+    """Baca deret waktu di grid terdekat dari file NetCDF ERA5.
+    Hasilnya sama dengan baca_titik_grib: (seri, meta, grid, peringatan)."""
+    import xarray as xr
+
+    try:
+        ds = xr.open_dataset(path, decode_timedelta=True)
+    except Exception as e:  # noqa: BLE001
+        raise ValueError(f"{nama_tampil}: gagal membuka NetCDF ({e}).") from e
+
+    try:
+        nlat, nlon, nwaktu = _cari_nama(ds, NAMA_LINTANG), _cari_nama(ds, NAMA_BUJUR), _cari_nama(ds, NAMA_WAKTU)
+        if nlat is None or nlon is None:
+            raise ValueError(f"{nama_tampil}: koordinat lintang/bujur tidak ditemukan.")
+        if nwaktu is None:
+            raise ValueError(f"{nama_tampil}: koordinat waktu tidak ditemukan.")
+        lats = np.asarray(ds[nlat].values, dtype=float)
+        lons = np.asarray(ds[nlon].values, dtype=float)
+        if lats.ndim != 1 or lons.ndim != 1:
+            raise ValueError(f"{nama_tampil}: hanya grid lintang-bujur reguler yang didukung.")
+
+        LA, LO = np.meshgrid(lats, lons, indexing="ij")
+        d = jarak_km(lat, lon, LA, LO)
+        j0, i0 = np.unravel_index(np.argmin(d), d.shape)
+        dlat = float(np.abs(np.diff(lats)).min()) if lats.size > 1 else 0.25
+        dlon = float(np.abs(np.diff(lons)).min()) if lons.size > 1 else 0.25
+        resolusi = f"{dlat:g}° x {dlon:g}°"
+        peringatan = []
+        if d[j0, i0] > 1.5 * max(dlat, dlon) * 111.2:
+            peringatan.append(
+                f"{nama_tampil}: Koordinat input berada di luar cakupan data (lintang {lats.min():g} s.d. "
+                f"{lats.max():g}, bujur {lons.min():g} s.d. {lons.max():g}). Grid terdekat berjarak {d[j0, i0]:.1f} km.")
+
+        variabel = [v for v, da in ds.data_vars.items() if nlat in da.dims and nlon in da.dims]
+        if not variabel:
+            raise ValueError(f"{nama_tampil}: tidak ada variabel bergrid di file ini.")
+
+        seri, meta, pilihan = {}, {}, {}
+        for k, nama in enumerate(variabel):
+            da = ds[nama]
+            lain = [x for x in da.dims if x not in (nlat, nlon)]
+
+            # Pilih grid: grid terdekat, atau grid berisi terdekat kalau lewati_kosong
+            j, i, catatan = int(j0), int(i0), ""
+            if lewati_kosong:
+                irisan = da.isel({x: 0 for x in lain}).transpose(nlat, nlon).values
+                isi = np.isfinite(irisan)
+                if isi.any() and not isi[j0, i0]:
+                    j, i = np.unravel_index(np.argmin(np.where(isi, d, np.inf)), d.shape)
+                    j, i = int(j), int(i)
+                    catatan = (f"Grid terdekat ({lats[j0]:g}, {lons[i0]:g}) tidak berisi data, "
+                               f"dipakai grid berisi terdekat.")
+            pilihan[nama] = (j, i, catatan)
+
+            titik = da.isel({nlat: j, nlon: i}).load()
+
+            # Format CDS lama: ERA5 final (expver 1) dan ERA5T (expver 5) di dimensi terpisah
+            if "expver" in titik.dims:
+                gabung = titik.isel(expver=0)
+                for e in range(1, titik.sizes["expver"]):
+                    gabung = gabung.combine_first(titik.isel(expver=e))
+                titik = gabung
+
+            df = titik.to_dataframe(name="__nilai").reset_index()
+            if "valid_time" in df.columns:
+                waktu = pd.to_datetime(df["valid_time"])
+            else:
+                waktu = pd.to_datetime(df[nwaktu])
+                if "step" in df.columns:
+                    waktu = waktu + pd.to_timedelta(df["step"])
+            if getattr(waktu.dt, "tz", None) is not None:
+                waktu = waktu.dt.tz_convert(None)
+
+            dim_level = [x for x in titik.dims if x not in (nwaktu, "valid_time", "time", "step")]
+            kerja = pd.DataFrame({"waktu": waktu.values, "nilai": df["__nilai"].values})
+            if dim_level:
+                def label_baris(r, dims=dim_level):
+                    bagian = []
+                    for x in dims:
+                        pola = NAMA_LEVEL.get(x)
+                        if pola:
+                            bagian.append(pola.format(float(r[x])))
+                        elif x == "number":
+                            bagian.append(f"anggota {int(r[x])}")
+                        else:
+                            bagian.append(f"{x} {r[x]}")
+                    return ", ".join(bagian)
+                kerja["label"] = df[dim_level].apply(label_baris, axis=1).values
+            else:
+                kerja["label"] = ""
+                for x, pola in NAMA_LEVEL.items():           # level tunggal sebagai koordinat skalar
+                    if x in titik.coords and titik[x].ndim == 0:
+                        kerja["label"] = pola.format(float(titik[x].values))
+                        break
+            kerja = kerja.dropna(subset=["waktu", "nilai"])
+
+            for label, g in kerja.groupby("label", sort=False):
+                kunci = f"{nama}@{label}" if label else nama
+                s = g.groupby("waktu")["nilai"].first().sort_index()
+                s.index.name = "waktu"
+                seri[kunci] = s
+                meta[kunci] = {
+                    "nama": nama, "level": label,
+                    "satuan": da.attrs.get("units", "") or "",
+                    "nama_panjang": da.attrs.get("long_name", nama) or nama,
+                    "jenis_langkah": da.attrs.get("GRIB_stepType", "") or "",
+                    "langkah_maks_jam": None,          # NetCDF tidak menyimpan step, ditebak dari data
+                    "md5": "nc",
+                }
+            if kabar:
+                kabar((k + 1) / len(variabel))
+    finally:
+        ds.close()
+
+    kelompok = {}
+    for nama, (j, i, catatan) in pilihan.items():
+        kelompok.setdefault((j, i, catatan), []).append(nama)
+    grid = []
+    for (j, i, catatan), daftar_var in kelompok.items():
+        lon_g = float(lons[i])
+        if lon_g > 180:
+            lon_g -= 360
+        grid.append(InfoGrid(nama_tampil, ", ".join(daftar_var), float(lats[j]), lon_g,
+                             float(d[j, i]), resolusi, catatan))
+    return seri, meta, grid, peringatan
+
+
+def tampak_kumulatif(s: pd.Series) -> bool:
+    """Tebak apakah deret akumulasi dihitung sejak 00 UTC (gaya ERA5-Land):
+    nilainya hampir tidak pernah turun dari jam ke jam, kecuali saat reset pukul 01 UTC."""
+    s = s.dropna().sort_index()
+    if len(s) < 48:
+        return False
+    beda = s.diff()
+    kontinu = (s.index.to_series().diff() == pd.Timedelta(hours=1)).values
+    bukan_reset = s.index.hour != 1
+    beda = beda[kontinu & bukan_reset]
+    ambang = 1e-4 * max(float(s.abs().max()), 1e-12)
+    bermakna = beda[beda.abs() > ambang]
+    if len(bermakna) < 10:
+        return False
+    return float((bermakna < 0).mean()) < 0.05
+
+
+# --------------------------------------------------------------------------
 # Terjemahan variabel
 # --------------------------------------------------------------------------
 def ke_mata_angin(derajat: pd.Series) -> pd.Series:
@@ -556,7 +762,10 @@ def terjemahkan(mentah: pd.DataFrame, meta: dict, mode_akumulasi="otomatis"):
                 if jns in ("jumlah", "fluks"):
                     mode = mode_akumulasi
                     if mode == "otomatis":
-                        mode = "sejak_00" if (m["langkah_maks_jam"] or 0) > 12 else "per_jam"
+                        if m["langkah_maks_jam"] is None:
+                            mode = "sejak_00" if tampak_kumulatif(s) else "per_jam"
+                        else:
+                            mode = "sejak_00" if m["langkah_maks_jam"] > 12 else "per_jam"
                     if mode == "sejak_00":
                         s = kumulatif_ke_per_jam(s).reindex(mentah.index)
                         ket += "; diubah dari akumulasi sejak 00 UTC ke nilai per jam"
@@ -589,15 +798,30 @@ def terjemahkan(mentah: pd.DataFrame, meta: dict, mode_akumulasi="otomatis"):
 def proses(daftar_file, lat, lon, zona="UTC", mode_akumulasi="otomatis", lewati_kosong=True, kabar=None):
     """daftar_file: list (path, nama_tampil). kabar(fraksi, teks) untuk progress."""
     semua_seri, meta, grid, peringatan = {}, {}, [], []
-    total = len(daftar_file)
-    for k, (path, nama) in enumerate(daftar_file):
-        sub = (lambda fr, k=k, nama=nama: kabar((k + fr) / total, f"Membaca {nama} ({fr:.0%})")) if kabar else None
-        s, m, g, p = baca_titik_grib(path, nama, lat, lon, lewati_kosong, sub)
-        for k, v in s.items():
-            semua_seri[k] = v if k not in semua_seri else semua_seri[k].combine_first(v)
-        meta.update(m)
-        grid.extend(g)
-        peringatan.extend(p)
+    folder_zip = tempfile.mkdtemp(prefix="era5_zip_")
+    try:
+        daftar = []
+        for path, nama in daftar_file:
+            jenis = jenis_file(path)
+            if jenis == "zip":
+                daftar += [(p, n, jenis_file(p)) for p, n in buka_zip(path, nama, folder_zip)]
+            elif jenis in ("grib", "nc"):
+                daftar.append((path, nama, jenis))
+            else:
+                raise ValueError(f"{nama}: format tidak dikenali. Gunakan file GRIB, NetCDF (.nc), atau ZIP dari CDS.")
+        total = len(daftar)
+        for k, (path, nama, jenis) in enumerate(daftar):
+            sub = (lambda fr, k=k, nama=nama: kabar((k + fr) / total, f"Membaca {nama} ({fr:.0%})")) if kabar else None
+            pembaca = baca_titik_nc if jenis == "nc" else baca_titik_grib
+            s, m, g, p = pembaca(path, nama, lat, lon, lewati_kosong, sub)
+            for kunci, v in s.items():
+                semua_seri[kunci] = v if kunci not in semua_seri else semua_seri[kunci].combine_first(v)
+            meta.update(m)
+            grid.extend(g)
+            peringatan.extend(p)
+    finally:
+        import shutil
+        shutil.rmtree(folder_zip, ignore_errors=True)
     if not semua_seri:
         raise ValueError("Tidak ada variabel yang berhasil diambil dari file.")
 
@@ -1081,7 +1305,7 @@ def _tile(url_pola, z, x, y):
 
     n = 2 ** z
     url = url_pola.format(s="abcd"[(x + y) % 4], z=z, x=x % n, y=y)
-    req = urllib.request.Request(url, headers={"User-Agent": "grib-ke-excel/1.0 (aplikasi Streamlit)"})
+    req = urllib.request.Request(url, headers={"User-Agent": "analisis-titik-era5/1.0 (aplikasi Streamlit)"})
     try:
         with urllib.request.urlopen(req, timeout=8) as r:
             return Image.open(io.BytesIO(r.read())).convert("RGB")
@@ -1557,21 +1781,25 @@ def buat_excel(h: Hasil, sertakan_mentah=False) -> bytes:
 def main():
     import streamlit as st
 
-    st.set_page_config(page_title="GRIB ke Excel", layout="wide")
-    st.title("GRIB ke Excel")
-    st.caption("Ambil deret waktu ERA5 dari file GRIB pada titik grid terdekat, lalu simpan sebagai Excel.")
+    st.set_page_config(page_title=JUDUL_APLIKASI, page_icon="🌬️", layout="wide")
+    st.title(JUDUL_APLIKASI)
+    st.caption("Ambil deret waktu ERA5 di koordinat pilihanmu dari file GRIB, NetCDF, atau ZIP unduhan CDS. "
+               "Hasilnya bisa dilihat sebagai grafik, windrose, dan windrose di peta, lalu diunduh sebagai "
+               "Excel atau gambar.")
 
     with st.sidebar:
-        st.header("1. File GRIB")
+        st.header("1. File data")
         cara = st.radio("Sumber file", ["Unggah", "Path di komputer"], horizontal=True,
                         help="File besar lebih cepat dibaca langsung dari path tanpa diunggah.")
         unggahan, path_teks = [], ""
         if cara == "Unggah":
-            unggahan = st.file_uploader("Pilih file .grib", accept_multiple_files=True,
-                                        type=["grib", "grb", "grib1", "grib2", "grb2"])
+            unggahan = st.file_uploader("Pilih file GRIB, NetCDF, atau ZIP", accept_multiple_files=True,
+                                        type=EKSTENSI_MASUKAN,
+                                        help="ZIP dari CDS (misalnya NetCDF yang terpecah jadi file instant "
+                                             "dan accum) bisa langsung diunggah tanpa diekstrak.")
         else:
             path_teks = st.text_area("Path file, satu per baris",
-                                     placeholder="D:/data/era5_angin_2024.grib")
+                                     placeholder="D:/data/era5_angin_2024.nc")
 
         st.header("2. Lokasi")
         c1, c2 = st.columns(2)
@@ -1607,7 +1835,8 @@ def main():
                     st.warning("Belum ada file yang diunggah.")
                     st.stop()
                 for f in unggahan:
-                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".grib")
+                    ekst = os.path.splitext(f.name)[1].lower() or ".dat"
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ekst)
                     tmp.write(f.getbuffer())
                     tmp.close()
                     sementara.append(tmp.name)
@@ -1622,7 +1851,7 @@ def main():
                     st.warning("Isi path file dulu.")
                     st.stop()
 
-            bar = st.progress(0.0, text="Mulai membaca GRIB...")
+            bar = st.progress(0.0, text="Mulai membaca file...")
             hasil = proses(daftar, float(lat), float(lon), zona, mode_label[mode], lewati,
                            kabar=lambda fr, teks: bar.progress(min(fr, 1.0) * 0.9, text=teks))
             bar.progress(0.92, text="Menulis Excel...")
@@ -1634,8 +1863,10 @@ def main():
         except Exception as e:  # noqa: BLE001
             pesan = str(e)
             st.error(f"Gagal memproses file: {pesan}")
-            if "eccodes" in pesan.lower() or "ecCodes" in pesan:
+            if "eccodes" in pesan.lower():
                 st.info("Library ecCodes belum terpasang. Coba: pip install eccodes")
+            elif "netcdf" in pesan.lower() or "engine" in pesan.lower():
+                st.info("Library untuk membaca NetCDF belum lengkap. Coba: pip install xarray netCDF4")
             st.stop()
         finally:
             for p in sementara:
@@ -1646,7 +1877,7 @@ def main():
 
     hasil: Hasil | None = st.session_state.get("hasil")
     if hasil is None:
-        st.info("Pilih file GRIB, isi koordinat, lalu tekan Proses.")
+        st.info("Pilih file ERA5 (GRIB, NetCDF, atau ZIP), isi koordinat, lalu tekan Proses.")
         return
 
     for p in hasil.peringatan:
