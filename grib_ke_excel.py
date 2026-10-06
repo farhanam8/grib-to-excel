@@ -10,10 +10,12 @@ Cara jalan:
 
 Alur:
     1. Pengguna memasukkan koordinat (lintang, bujur).
-    2. Aplikasi mencari titik grid terdekat di setiap dataset dalam file GRIB.
+    2. Aplikasi mencari titik grid terdekat untuk setiap bentuk grid di file GRIB,
+       lalu membaca nilai di titik itu saja dari setiap message (via ecCodes).
     3. Variabel mentah diterjemahkan ke besaran yang mudah dibaca,
        misalnya u10 + v10 menjadi kecepatan dan arah angin.
-    4. Hasilnya diunduh sebagai Excel (sheet Data, Ringkasan, Info).
+    4. Grafik deret waktu (resolusi otomatis) dan windrose untuk data angin.
+    5. Hasilnya diunduh sebagai Excel (sheet Data, Ringkasan, Windrose, Info).
 """
 
 from __future__ import annotations
@@ -34,8 +36,6 @@ R_BUMI_KM = 6371.0088
 NAMA_ARAH = ["Utara", "Timur Laut", "Timur", "Tenggara",
              "Selatan", "Barat Daya", "Barat", "Barat Laut"]
 ZONA_WAKTU = {"UTC": 0, "WIB (UTC+7)": 7, "WITA (UTC+8)": 8, "WIT (UTC+9)": 9}
-DIM_WAKTU = {"time", "step", "valid_time"}
-DIM_RUANG = {"latitude", "longitude"}
 
 # --------------------------------------------------------------------------
 # Kamus terjemahan variabel
@@ -139,17 +139,17 @@ class Hasil:
     lat_input: float = 0.0
     lon_input: float = 0.0
     sumber: list = field(default_factory=list)
+    angin: list = field(default_factory=list)   # [{"nama", "kec", "arah"}] untuk windrose
 
 
 # --------------------------------------------------------------------------
 # Membaca GRIB dan memilih grid
 # --------------------------------------------------------------------------
-def buka_grib(path: str):
-    """Buka semua 'hypercube' di file GRIB. ERA5 sering mencampur variabel
-    instan dan akumulasi, jadi open_datasets lebih aman dari open_dataset."""
-    import cfgrib
-    return cfgrib.open_datasets(path, backend_kwargs={"indexpath": ""})
-
+# GRIB disimpan sebagai deretan "message", satu message = satu variabel pada
+# satu waktu dan satu level. Aplikasi ini membaca message satu per satu lewat
+# ecCodes dan hanya mengambil SATU nilai (titik grid terpilih) dari tiap message,
+# tanpa membongkar seluruh peta. Ini jauh lebih cepat dan hemat memori
+# dibanding membuka seluruh file dengan xarray/cfgrib.
 
 def jarak_km(lat1, lon1, lat2, lon2):
     p1, p2 = np.radians(lat1), np.radians(lat2)
@@ -159,143 +159,333 @@ def jarak_km(lat1, lon1, lat2, lon2):
     return 2 * R_BUMI_KM * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
 
 
-def _mask_berisi(ds):
-    """Peta True/False grid yang punya nilai. Dipakai supaya titik daratan
-    tidak terpilih untuk data laut (gelombang, SST) dan sebaliknya."""
-    var = next(iter(ds.data_vars.values()))
-    lain = [d for d in var.dims if d not in DIM_RUANG]
-    if not lain:
-        arr = var.transpose("latitude", "longitude").values
-        return np.isfinite(arr)
-    bentuk = [var.sizes[d] for d in lain]
-    for k in range(min(int(np.prod(bentuk)), 60)):
-        idx = dict(zip(lain, np.unravel_index(k, bentuk)))
-        arr = var.isel(idx).transpose("latitude", "longitude").values
-        if np.isfinite(arr).any():
-            return np.isfinite(arr)
-    return None
+def _ambil(ec, h, kunci, bawaan=None):
+    try:
+        return ec.codes_get(h, kunci) if ec.codes_is_defined(h, kunci) else bawaan
+    except Exception:  # noqa: BLE001
+        return bawaan
 
 
-def cari_grid_terdekat(ds, lat, lon, lewati_kosong=True):
-    """Kembalikan (j, i, lat_grid, lon_grid, jarak_km, catatan, peringatan)."""
-    if "latitude" not in ds.dims or "longitude" not in ds.dims:
-        raise ValueError("Dataset tidak memakai grid lintang-bujur reguler.")
-    lats = ds["latitude"].values
-    lons = ds["longitude"].values
-    LA, LO = np.meshgrid(lats, lons, indexing="ij")
-    d = jarak_km(lat, lon, LA, LO)
+def _geometri(ec, h, lat, lon):
+    """Hitung jarak input ke semua titik grid. Dipanggil sekali per bentuk grid."""
+    lats = ec.codes_get_array(h, "latitudes")
+    lons = ec.codes_get_array(h, "longitudes")
+    d = jarak_km(lat, lon, lats, lons)
+    idx0 = int(np.argmin(d))
 
-    j0, i0 = np.unravel_index(np.argmin(d), d.shape)
-    catatan, peringatan = "", ""
+    if _ambil(ec, h, "gridType") == "regular_ll":
+        di = float(_ambil(ec, h, "iDirectionIncrementInDegrees", 0.25))
+        dj = float(_ambil(ec, h, "jDirectionIncrementInDegrees", 0.25))
+        resolusi, langkah = f"{di:g}° x {dj:g}°", max(di, dj)
+    else:
+        resolusi, langkah = str(_ambil(ec, h, "gridType", "-")), 0.5
 
-    dlat = float(np.abs(np.diff(lats)).min()) if lats.size > 1 else 0.25
-    dlon = float(np.abs(np.diff(lons)).min()) if lons.size > 1 else 0.25
-    batas = 1.5 * max(dlat, dlon) * 111.2
-    if d[j0, i0] > batas:
+    peringatan = ""
+    if d[idx0] > 1.5 * langkah * 111.2:
         peringatan = (f"Koordinat input berada di luar cakupan data "
-                      f"({lats.min():g} s.d. {lats.max():g} LU/LS, "
-                      f"{lons.min():g} s.d. {lons.max():g} BT/BB). "
-                      f"Grid terdekat berjarak {d[j0, i0]:.1f} km.")
-
-    j, i = j0, i0
-    if lewati_kosong:
-        mask = _mask_berisi(ds)
-        if mask is not None and mask.any() and not mask[j0, i0]:
-            d2 = np.where(mask, d, np.inf)
-            j, i = np.unravel_index(np.argmin(d2), d2.shape)
-            catatan = (f"Grid terdekat ({lats[j0]:g}, {lons[i0]:g}) tidak berisi data, "
-                       f"dipakai grid berisi terdekat.")
-
-    lon_g = float(lons[i])
-    if lon_g > 180:
-        lon_g -= 360
-    return int(j), int(i), float(lats[j]), lon_g, float(d[j, i]), catatan, peringatan, f"{dlat:g}° x {dlon:g}°"
+                      f"(lintang {lats.min():g} s.d. {lats.max():g}, bujur {lons.min():g} s.d. {lons.max():g}). "
+                      f"Grid terdekat berjarak {d[idx0]:.1f} km.")
+    return {"lats": lats, "lons": lons, "d": d, "idx0": idx0,
+            "resolusi": resolusi, "peringatan": peringatan}
 
 
-def _label_level(dim, nilai):
-    if dim == "isobaricInhPa":
-        return f"{float(nilai):g} hPa"
-    if dim == "depthBelowLandLayer":
-        return f"kedalaman {float(nilai):g} m"
-    if dim == "number":
-        return f"anggota {int(nilai)}"
-    return f"{dim} {nilai}"
+def _label_level(ec, h):
+    jenis = _ambil(ec, h, "typeOfLevel", "")
+    level = _ambil(ec, h, "level", 0)
+    label = ""
+    if jenis == "isobaricInhPa":
+        label = f"{level:g} hPa"
+    elif jenis in ("hybrid", "modelLevel"):
+        label = f"model level {level}"
+    elif jenis == "potentialVorticity":
+        label = f"PV {level}"
+    elif jenis == "theta":
+        label = f"theta {level} K"
+    anggota = _ambil(ec, h, "numberOfForecastsInEnsemble", 0) or 0
+    if anggota > 1:
+        no = _ambil(ec, h, "number", 0)
+        label = f"{label}, anggota {no}" if label else f"anggota {no}"
+    return label
 
 
-def ekstrak_titik(ds, j, i):
-    """Ambil deret waktu di satu titik grid. Hasil: dict kunci -> Series
-    (index waktu UTC) dan dict meta per kunci."""
-    titik = ds.isel(latitude=j, longitude=i).load()
-    seri, meta = {}, {}
-    for nama, da in titik.data_vars.items():
-        # Koordinat waktu skalar (file berisi satu waktu) dijadikan dimensi
-        for c in ("time", "step"):
-            if c in da.coords and c not in da.dims and da[c].ndim == 0:
-                da = da.expand_dims(c)
+def _pesan_grib(path):
+    """Potong file menjadi message GRIB mentah (bytes) tanpa ecCodes.
+    Menghasilkan (posisi_byte, bytes). Message GRIB1 berukuran sangat besar
+    (format 'large GRIB1') dikembalikan None supaya dibaca lewat ecCodes."""
+    import mmap
+    with open(path, "rb") as f:
+        if os.path.getsize(path) == 0:
+            return
+        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        try:
+            pos, n = 0, len(mm)
+            while True:
+                pos = mm.find(b"GRIB", pos)
+                if pos < 0 or pos + 16 > n:
+                    break
+                edisi = mm[pos + 7]
+                if edisi == 1:
+                    panjang = int.from_bytes(mm[pos + 4:pos + 7], "big")
+                    if panjang & 0x800000:          # large GRIB1, serahkan ke ecCodes
+                        yield pos, None
+                        return
+                elif edisi == 2:
+                    panjang = int.from_bytes(mm[pos + 8:pos + 16], "big")
+                else:
+                    pos += 4
+                    continue
+                if panjang < 16 or pos + panjang > n:
+                    break
+                yield pos, mm[pos:pos + panjang]
+                pos += panjang
+        finally:
+            mm.close()
 
-        label_tetap = []
-        for c in ("isobaricInhPa", "depthBelowLandLayer"):
-            if c in da.coords and c not in da.dims and da[c].ndim == 0:
-                label_tetap.append(_label_level(c, da[c].values))
-        dim_level = [d for d in da.dims if d not in DIM_WAKTU]
 
-        df = da.to_dataframe(name="__nilai").reset_index()
-        if "valid_time" in df.columns:
-            waktu = pd.to_datetime(df["valid_time"])
-        elif "time" in df.columns:
-            waktu = pd.to_datetime(df["time"])
-            if "step" in df.columns:
-                waktu = waktu + pd.to_timedelta(df["step"])
+def _tanda_besaran(b):
+    """Bilangan bulat bertanda gaya GRIB1 (bit pertama = tanda)."""
+    v = int.from_bytes(b, "big")
+    bit = len(b) * 8 - 1
+    return -(v & ((1 << bit) - 1)) if v >> bit else v
+
+
+def _ibm_float(b):
+    s = -1.0 if b[0] & 0x80 else 1.0
+    eksp = (b[0] & 0x7F) - 64
+    mant = int.from_bytes(b[1:4], "big")
+    return s * mant * 2.0 ** -24 * 16.0 ** eksp
+
+
+_SATUAN_WAKTU_GRIB1 = {0: 1 / 60, 1: 1, 2: 24, 10: 3, 11: 6, 12: 12, 13: 0.25, 14: 0.5, 254: 1 / 3600}
+
+
+def _grib1_cepat(m):
+    """Urai header GRIB1 dengan packing sederhana (format umum ERA5 dari CDS).
+    Mengembalikan dict, atau None kalau format di luar jalur cepat."""
+    pl = int.from_bytes(m[8:11], "big")
+    pds = m[8:8 + pl]
+    if pl < 28:
+        return None
+    bendera = pds[7]
+    if not bendera & 0x80:                       # tanpa GDS, tidak bisa
+        return None
+    satuan = _SATUAN_WAKTU_GRIB1.get(pds[17])
+    p1, p2, tri = pds[18], pds[19], pds[20]
+    if satuan is None or tri not in (0, 1, 2, 3, 4, 5, 10):
+        return None
+    if tri == 10:
+        geser = (p1 * 256 + p2) * satuan
+    elif tri in (2, 3, 4, 5):
+        geser = p2 * satuan
+    elif tri == 0:
+        geser = p1 * satuan
+    else:
+        geser = 0
+    tahun = (pds[24] - 1) * 100 + pds[12]
+    try:
+        waktu = pd.Timestamp(tahun, pds[13], pds[14], pds[15], pds[16]) + pd.Timedelta(hours=geser)
+    except ValueError:
+        return None
+
+    off = 8 + pl
+    gl = int.from_bytes(m[off:off + 3], "big")
+    gds = m[off:off + gl]
+    off += gl
+    bitmap = None
+    if bendera & 0x40:
+        bl = int.from_bytes(m[off:off + 3], "big")
+        if int.from_bytes(m[off + 4:off + 6], "big") != 0:   # bitmap bawaan, jarang
+            return None
+        bitmap = m[off + 6:off + bl]
+        off += bl
+    if m[off + 3] & 0xF0:                        # bukan grid point simple packing
+        return None
+    return {
+        "header": (pds[3], pds[8], pds[9], pds[10], pds[11], gds),
+        "waktu": waktu,
+        "langkah": float(geser),
+        "D": _tanda_besaran(pds[26:28]),
+        "E": _tanda_besaran(m[off + 4:off + 6]),
+        "R": _ibm_float(m[off + 6:off + 10]),
+        "nb": m[off + 10],
+        "data": off + 11,
+        "bitmap": bitmap,
+    }
+
+
+def _nilai_grib1(m, c, idx, cache_bitmap):
+    """Ambil satu nilai dari data simple packing tanpa membongkar seluruh peta."""
+    p = idx
+    bm = c["bitmap"]
+    if bm is not None:
+        if not (bm[idx >> 3] >> (7 - (idx & 7))) & 1:
+            return np.nan
+        kunci = (bytes(bm), idx)
+        p = cache_bitmap.get(kunci)
+        if p is None:
+            bit = np.unpackbits(np.frombuffer(bm, dtype=np.uint8))
+            p = int(bit[:idx].sum())
+            cache_bitmap[kunci] = p
+    nb = c["nb"]
+    x = 0
+    if nb:
+        posbit = p * nb
+        awal = c["data"] + (posbit >> 3)
+        nbyte = ((posbit & 7) + nb + 7) >> 3
+        x = (int.from_bytes(m[awal:awal + nbyte], "big") >> (nbyte * 8 - (posbit & 7) - nb)) & ((1 << nb) - 1)
+    return (c["R"] + x * 2.0 ** c["E"]) / 10.0 ** c["D"]
+
+
+def baca_titik_grib(path, nama_tampil, lat, lon, lewati_kosong=True, kabar=None):
+    """Baca deret waktu di grid terdekat dari satu file GRIB.
+
+    Jalur cepat: message GRIB1 simple packing (format ERA5 dari CDS) diurai
+    langsung dengan Python, hanya mengambil satu nilai per message. ecCodes
+    cukup dipakai sekali untuk setiap kombinasi variabel/level/grid baru.
+    Jalur biasa: format lain (GRIB2, packing lain) dibaca lewat ecCodes.
+    kabar: fungsi opsional kabar(fraksi_0_sampai_1) untuk progress bar."""
+    import eccodes as ec
+
+    ukuran = max(os.path.getsize(path), 1)
+    geo = {}            # md5 grid -> info geometri
+    pilihan = {}        # (md5, variabel) -> (indeks, catatan)
+    daftar_header = {}  # header GRIB1 mentah -> info variabel
+    cache_bitmap = {}
+    nilai, meta = {}, {}
+    peringatan = set()
+    jumlah_ganda = 0
+    n = 0
+
+    def info_dari_handle(h):
+        """Metadata satu message lewat ecCodes, plus pemilihan grid."""
+        var = _ambil(ec, h, "cfVarName", "unknown")
+        if var in (None, "unknown", "~"):
+            var = _ambil(ec, h, "shortName", "unknown")
+        if var in (None, "unknown", "~"):
+            var = f"param{_ambil(ec, h, 'paramId', n)}"
+        md5 = _ambil(ec, h, "md5GridSection", "grid")
+        if md5 not in geo:
+            geo[md5] = _geometri(ec, h, lat, lon)
+            if geo[md5]["peringatan"]:
+                peringatan.add(f"{nama_tampil}: {geo[md5]['peringatan']}")
+        g = geo[md5]
+        ada_bitmap = bool(_ambil(ec, h, "bitmapPresent", 0))
+        hilang = float(_ambil(ec, h, "missingValue", 9999))
+        if (md5, var) not in pilihan:
+            idx, catatan = g["idx0"], ""
+            if lewati_kosong and ada_bitmap:
+                isi = ec.codes_get_values(h) != hilang
+                if isi.any() and not isi[idx]:
+                    idx = int(np.argmin(np.where(isi, g["d"], np.inf)))
+                    catatan = (f"Grid terdekat ({g['lats'][g['idx0']]:g}, {g['lons'][g['idx0']]:g}) "
+                               f"tidak berisi data, dipakai grid berisi terdekat.")
+            pilihan[(md5, var)] = (idx, catatan)
+        label = _label_level(ec, h)
+        return {
+            "var": var, "md5": md5, "idx": pilihan[(md5, var)][0], "label": label,
+            "kunci": f"{var}@{label}" if label else var,
+            "ada_bitmap": ada_bitmap, "hilang": hilang,
+            "satuan": _ambil(ec, h, "units", "") or "",
+            "nama_panjang": _ambil(ec, h, "name", var) or var,
+            "jenis_langkah": _ambil(ec, h, "stepType", "") or "",
+        }
+
+    def simpan(info, waktu, v, langkah):
+        nonlocal jumlah_ganda
+        kunci = info["kunci"]
+        deret = nilai.setdefault(kunci, {})
+        if waktu in deret:
+            jumlah_ganda += 1
         else:
-            continue
-
-        kerja = pd.DataFrame({"waktu": waktu.values, "nilai": df["__nilai"].values})
-        if dim_level:
-            kerja["label"] = df[dim_level].apply(
-                lambda r: ", ".join(_label_level(dd, r[dd]) for dd in dim_level), axis=1)
-        else:
-            kerja["label"] = ""
-        if label_tetap:
-            awal = ", ".join(label_tetap)
-            kerja["label"] = kerja["label"].map(lambda s: f"{awal}, {s}" if s else awal)
-        kerja = kerja.dropna(subset=["waktu", "nilai"])
-
-        langkah_maks = None
-        if "step" in da.coords:
-            langkah = pd.to_timedelta(np.atleast_1d(da["step"].values))
-            if len(langkah):
-                langkah_maks = float(langkah.max() / pd.Timedelta(hours=1))
-
-        for label, g in kerja.groupby("label", sort=False):
-            kunci = f"{nama}@{label}" if label else nama
-            s = g.groupby("waktu")["nilai"].first().sort_index()
-            s.index.name = "waktu"
-            seri[kunci] = s
+            deret[waktu] = v
+        if kunci not in meta:
             meta[kunci] = {
-                "nama": nama,
-                "level": label,
-                "satuan": da.attrs.get("units", da.attrs.get("GRIB_units", "")),
-                "nama_panjang": da.attrs.get("long_name", da.attrs.get("GRIB_name", nama)),
-                "jenis_langkah": da.attrs.get("GRIB_stepType", ""),
-                "langkah_maks_jam": langkah_maks,
+                "nama": info["var"], "level": info["label"], "satuan": info["satuan"],
+                "nama_panjang": info["nama_panjang"], "jenis_langkah": info["jenis_langkah"],
+                "langkah_maks_jam": langkah, "md5": info["md5"],
             }
-    return seri, meta
+        elif langkah > meta[kunci]["langkah_maks_jam"]:
+            meta[kunci]["langkah_maks_jam"] = langkah
 
+    def lewat_eccodes(h):
+        info = info_dari_handle(h)
+        v = ec.codes_get_double_element(h, "values", info["idx"])
+        if info["ada_bitmap"] and v == info["hilang"]:
+            v = np.nan
+        tgl = int(_ambil(ec, h, "validityDate"))
+        jam = int(_ambil(ec, h, "validityTime"))
+        waktu = pd.Timestamp(tgl // 10000, tgl // 100 % 100, tgl % 100, jam // 100, jam % 100)
+        try:
+            langkah = float(_ambil(ec, h, "endStep", 0))
+        except (TypeError, ValueError):
+            langkah = 0.0
+        simpan(info, waktu, v, langkah)
 
-def proses_file(path, nama_tampil, lat, lon, lewati_kosong=True):
-    seri, meta, grid, peringatan = {}, {}, [], []
-    daftar = buka_grib(path)
-    if not daftar:
-        raise ValueError(f"{nama_tampil}: tidak ada data yang bisa dibaca.")
-    for ds in daftar:
-        j, i, lat_g, lon_g, jarak, catatan, warn, res = cari_grid_terdekat(ds, lat, lon, lewati_kosong)
-        if warn:
-            peringatan.append(f"{nama_tampil}: {warn}")
-        s, m = ekstrak_titik(ds, j, i)
-        seri.update(s)
-        meta.update(m)
-        grid.append(InfoGrid(nama_tampil, ", ".join(ds.data_vars), lat_g, lon_g, jarak, res, catatan))
-    return seri, meta, grid, peringatan
+    for pos, m in _pesan_grib(path):
+        if m is None:
+            # Format yang tidak bisa dipotong manual: baca sisa file lewat ecCodes
+            with open(path, "rb") as f:
+                f.seek(pos)
+                while True:
+                    h = ec.codes_grib_new_from_file(f)
+                    if h is None:
+                        break
+                    try:
+                        lewat_eccodes(h)
+                    finally:
+                        ec.codes_release(h)
+                    n += 1
+                    if kabar and n % 250 == 0:
+                        kabar(min(f.tell() / ukuran, 1.0))
+            break
+
+        c = _grib1_cepat(m) if m[7] == 1 else None
+        if c is not None:
+            info = daftar_header.get(c["header"])
+            if info is None:
+                h = ec.codes_new_from_message(bytes(m))
+                try:
+                    info = info_dari_handle(h)
+                finally:
+                    ec.codes_release(h)
+                daftar_header[c["header"]] = info
+            simpan(info, c["waktu"], _nilai_grib1(m, c, info["idx"], cache_bitmap), c["langkah"])
+        else:
+            h = ec.codes_new_from_message(bytes(m))
+            try:
+                lewat_eccodes(h)
+            finally:
+                ec.codes_release(h)
+
+        n += 1
+        if kabar and n % 2000 == 0:
+            kabar(min(pos / ukuran, 1.0))
+
+    if n == 0:
+        raise ValueError(f"{nama_tampil}: tidak ada message GRIB yang terbaca. Pastikan file berformat GRIB.")
+    if jumlah_ganda:
+        peringatan.add(f"{nama_tampil}: {jumlah_ganda} nilai ganda (variabel, level, dan waktu sama) diabaikan.")
+
+    seri = {}
+    for kunci, deret in nilai.items():
+        s = pd.Series(deret, dtype=float).sort_index()
+        s.index.name = "waktu"
+        seri[kunci] = s
+
+    kelompok = {}
+    for (md5, var), (idx, catatan) in pilihan.items():
+        kelompok.setdefault((md5, idx, catatan), []).append(var)
+    grid = []
+    for (md5, idx, catatan), daftar_var in kelompok.items():
+        g = geo[md5]
+        lon_g = float(g["lons"][idx])
+        if lon_g > 180:
+            lon_g -= 360
+        grid.append(InfoGrid(nama_tampil, ", ".join(daftar_var), float(g["lats"][idx]), lon_g,
+                             float(g["d"][idx]), g["resolusi"], catatan))
+    if kabar:
+        kabar(1.0)
+    return seri, meta, grid, sorted(peringatan)
 
 
 # --------------------------------------------------------------------------
@@ -324,7 +514,7 @@ def kumulatif_ke_per_jam(s: pd.Series) -> pd.Series:
 
 
 def terjemahkan(mentah: pd.DataFrame, meta: dict, mode_akumulasi="otomatis"):
-    keluar, satuan, jenis, konversi = {}, {}, {}, []
+    keluar, satuan, jenis, konversi, angin = {}, {}, {}, [], []
 
     grup = {}
     for kunci in mentah.columns:
@@ -349,6 +539,7 @@ def terjemahkan(mentah: pd.DataFrame, meta: dict, mode_akumulasi="otomatis"):
                 arah = (270 - np.degrees(np.arctan2(V, U))) % 360
                 asal = f"{var[u]}, {var[v]}"
                 tambah(f"Kecepatan {dasar} (m/s)", kec, "m/s", "biasa", asal, "akar(u² + v²)")
+                angin.append({"nama": dasar, "kec": f"Kecepatan {dasar} (m/s)", "arah": f"Arah {dasar} (°)"})
                 tambah(f"Arah {dasar} (°)", arah, "°", "arah", asal,
                        "derajat dari utara searah jarum jam, arah datangnya angin")
                 tambah(f"Arah {dasar} (mata angin)", ke_mata_angin(arah), "", "teks", asal,
@@ -392,14 +583,16 @@ def terjemahkan(mentah: pd.DataFrame, meta: dict, mode_akumulasi="otomatis"):
                    f"{var['t2m']}, {var['d2m']}", "rumus Magnus dari suhu udara dan titik embun")
 
     data = pd.DataFrame(keluar, index=mentah.index)
-    return data, satuan, jenis, konversi
+    return data, satuan, jenis, konversi, angin
 
 
-def proses(daftar_file, lat, lon, zona="UTC", mode_akumulasi="otomatis", lewati_kosong=True):
-    """daftar_file: list (path, nama_tampil)."""
+def proses(daftar_file, lat, lon, zona="UTC", mode_akumulasi="otomatis", lewati_kosong=True, kabar=None):
+    """daftar_file: list (path, nama_tampil). kabar(fraksi, teks) untuk progress."""
     semua_seri, meta, grid, peringatan = {}, {}, [], []
-    for path, nama in daftar_file:
-        s, m, g, p = proses_file(path, nama, lat, lon, lewati_kosong)
+    total = len(daftar_file)
+    for k, (path, nama) in enumerate(daftar_file):
+        sub = (lambda fr, k=k, nama=nama: kabar((k + fr) / total, f"Membaca {nama} ({fr:.0%})")) if kabar else None
+        s, m, g, p = baca_titik_grib(path, nama, lat, lon, lewati_kosong, sub)
         for k, v in s.items():
             semua_seri[k] = v if k not in semua_seri else semua_seri[k].combine_first(v)
         meta.update(m)
@@ -410,15 +603,193 @@ def proses(daftar_file, lat, lon, zona="UTC", mode_akumulasi="otomatis", lewati_
 
     mentah = pd.concat(semua_seri, axis=1).sort_index()
     mentah.index.name = "waktu"
-    data, satuan, jenis, konversi = terjemahkan(mentah, meta, mode_akumulasi)
+    data, satuan, jenis, konversi, angin = terjemahkan(mentah, meta, mode_akumulasi)
 
     geser = pd.Timedelta(hours=ZONA_WAKTU[zona])
     data.index = data.index + geser
     data = data.dropna(how="all")
 
     return Hasil(data=data, mentah=mentah, meta=meta, satuan=satuan, jenis=jenis,
-                 konversi=konversi, grid=grid, peringatan=peringatan, zona=zona,
+                 konversi=konversi, grid=grid, peringatan=peringatan, zona=zona, angin=angin,
                  lat_input=lat, lon_input=lon, sumber=[n for _, n in daftar_file])
+
+
+# --------------------------------------------------------------------------
+# Grafik deret waktu dan windrose
+# --------------------------------------------------------------------------
+RESOLUSI = {"Per jam": None, "Per hari": "D", "Per bulan": "MS", "Per tahun": "YS"}
+
+# Kelas kecepatan angin (m/s) mengikuti pembagian umum WRPLOT
+TENANG = 0.5
+KELAS_ANGIN = [(0.5, 2.1), (2.1, 3.6), (3.6, 5.7), (5.7, 8.8), (8.8, 11.1), (11.1, np.inf)]
+LABEL_KELAS = ["0,5-2,1", "2,1-3,6", "3,6-5,7", "5,7-8,8", "8,8-11,1", "≥ 11,1"]
+WARNA_KELAS = ["#c6dbef", "#6baed6", "#2171b5", "#fdae6b", "#e6550d", "#a63603"]
+SEKTOR = {
+    16: ["U", "UTL", "TL", "TTL", "T", "TTG", "TG", "STG", "S", "SBD", "BD", "BBD", "B", "BBL", "BL", "UBL"],
+    8: ["U", "TL", "T", "TG", "S", "BD", "B", "BL"],
+}
+NAMA_BULAN = ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli",
+              "Agustus", "September", "Oktober", "November", "Desember"]
+MUSIM = {
+    "Des-Jan-Feb (DJF)": [12, 1, 2],
+    "Mar-Apr-Mei (MAM)": [3, 4, 5],
+    "Jun-Jul-Agu (JJA)": [6, 7, 8],
+    "Sep-Okt-Nov (SON)": [9, 10, 11],
+}
+
+
+def resolusi_otomatis(index) -> str:
+    """Pilih resolusi grafik dari panjang rentang data."""
+    if len(index) < 2:
+        return "Per jam"
+    rentang = index.max() - index.min()
+    if rentang <= pd.Timedelta(days=7):
+        return "Per jam"
+    if rentang <= pd.Timedelta(days=120):
+        return "Per hari"
+    if rentang <= pd.Timedelta(days=3 * 366):
+        return "Per bulan"
+    return "Per tahun"
+
+
+KOLOM_AGREGASI = ["waktu", "label", "nilai", "min", "maks", "p10", "p90", "n", "kelengkapan"]
+
+
+def agregasi(s: pd.Series, jenis: str, resolusi: str) -> pd.DataFrame:
+    """Ringkas deret waktu per periode. 'nilai' = total untuk variabel akumulasi,
+    rata-rata untuk lainnya. p10/p90 = persentil 10 dan 90 data di periode itu."""
+    s = s.dropna().sort_index()
+    frek = RESOLUSI[resolusi]
+    if s.empty:
+        return pd.DataFrame(columns=KOLOM_AGREGASI)
+    if frek is None:
+        return pd.DataFrame({"waktu": s.index, "label": s.index.strftime("%Y-%m-%d %H:%M"),
+                             "nilai": s.values, "min": s.values, "maks": s.values,
+                             "p10": s.values, "p90": s.values, "n": 1, "kelengkapan": 1.0})
+
+    g = s.resample(frek)
+    df = pd.DataFrame({
+        "nilai": g.sum(min_count=1) if jenis == "jumlah" else g.mean(),
+        "min": g.min(), "maks": g.max(), "p10": g.quantile(0.1), "p90": g.quantile(0.9),
+        "n": g.count(),
+    }).dropna(subset=["nilai"])
+
+    # Kelengkapan: jumlah data dibanding yang seharusnya ada pada periode itu
+    langkah = s.index.to_series().diff().median()
+    if pd.isna(langkah) or langkah <= pd.Timedelta(0):
+        langkah = pd.Timedelta(hours=1)
+    ofs = pd.tseries.frequencies.to_offset(frek)
+    harusnya = [(t + ofs - t) / langkah for t in df.index]
+    df["kelengkapan"] = np.clip(df["n"].values / np.maximum(harusnya, 1), 0, 1)
+
+    fmt = {"D": "%Y-%m-%d", "MS": "%Y-%m", "YS": "%Y"}[frek]
+    df["label"] = df.index.strftime(fmt)
+    df.index.name = "waktu"
+    return df.reset_index()[KOLOM_AGREGASI]
+
+
+def grafik_deret(df: pd.DataFrame, nama: str, satuan: str, jenis: str, resolusi: str):
+    """Grafik Altair: batang untuk total akumulasi, garis rata-rata dengan
+    pita persentil 10-90 untuk variabel lain."""
+    import altair as alt
+
+    alt.data_transformers.disable_max_rows()
+    df = df.copy()
+    df["lengkap"] = np.where(df["kelengkapan"] >= 0.9, "Lengkap", "Belum lengkap")
+    df["kelengkapan_persen"] = (df["kelengkapan"] * 100).round(0)
+
+    per_jam = RESOLUSI[resolusi] is None
+    sumbu_x = (alt.X("waktu:T", title=None) if resolusi in ("Per jam", "Per hari")
+               else alt.X("label:O", title=None, sort=None, axis=alt.Axis(labelAngle=0 if resolusi == "Per tahun" else -45, labelOverlap="greedy")))
+    judul_y = f"{'Total' if jenis == 'jumlah' else 'Rata-rata'} {nama.split(' (')[0].lower()} ({satuan})" if not per_jam \
+        else f"{nama.split(' (')[0]} ({satuan})"
+    tip = [alt.Tooltip("label:N", title="Periode"),
+           alt.Tooltip("nilai:Q", title="Total" if jenis == "jumlah" else "Rata-rata", format=".2f")]
+    if not per_jam:
+        tip += [alt.Tooltip("p10:Q", title="Persentil 10", format=".2f"),
+                alt.Tooltip("p90:Q", title="Persentil 90", format=".2f"),
+                alt.Tooltip("min:Q", title="Minimum", format=".2f"),
+                alt.Tooltip("maks:Q", title="Maksimum", format=".2f"),
+                alt.Tooltip("n:Q", title="Jumlah data"),
+                alt.Tooltip("kelengkapan_persen:Q", title="Kelengkapan (%)")]
+
+    dasar = alt.Chart(df).encode(x=sumbu_x)
+    if jenis == "jumlah":
+        grafik = dasar.mark_bar(opacity=0.9).encode(
+            y=alt.Y("nilai:Q", title=judul_y),
+            opacity=alt.Opacity("lengkap:N", scale=alt.Scale(domain=["Lengkap", "Belum lengkap"], range=[0.9, 0.4]),
+                                legend=alt.Legend(title=None, orient="top")),
+            tooltip=tip)
+    elif per_jam:
+        grafik = dasar.mark_line(strokeWidth=1).encode(y=alt.Y("nilai:Q", title=judul_y), tooltip=tip)
+    else:
+        pita = dasar.mark_area(opacity=0.25).encode(y=alt.Y("p10:Q", title=judul_y), y2="p90:Q")
+        garis = dasar.mark_line(strokeWidth=2).encode(y="nilai:Q")
+        titik = dasar.mark_point(filled=True, size=60).encode(
+            y="nilai:Q", tooltip=tip,
+            shape=alt.Shape("lengkap:N", scale=alt.Scale(domain=["Lengkap", "Belum lengkap"], range=["circle", "triangle"]),
+                            legend=alt.Legend(title=None, orient="top")))
+        grafik = pita + garis + titik
+    return grafik.properties(height=360)
+
+
+def saring_periode(index, pilihan: str):
+    """Mask boolean untuk filter windrose: semua data, musim, bulan, atau tahun."""
+    if pilihan == "Semua data":
+        return np.ones(len(index), dtype=bool)
+    if pilihan in MUSIM:
+        return index.month.isin(MUSIM[pilihan])
+    if pilihan in NAMA_BULAN:
+        return index.month == NAMA_BULAN.index(pilihan) + 1
+    if pilihan.startswith("Tahun "):
+        return index.year == int(pilihan.split()[1])
+    return np.ones(len(index), dtype=bool)
+
+
+def tabel_windrose(kec: pd.Series, arah: pd.Series, n_sektor=16):
+    """Persentase kejadian per sektor arah x kelas kecepatan.
+    Mengembalikan (tabel %, persen tenang, jumlah data)."""
+    ok = kec.notna() & arah.notna()
+    kec, arah = kec[ok].values, arah[ok].values
+    total = len(kec)
+    label = SEKTOR[n_sektor]
+    tabel = pd.DataFrame(0.0, index=label, columns=LABEL_KELAS)
+    if total == 0:
+        return tabel, 0.0, 0
+    lebar = 360 / n_sektor
+    sektor = (np.floor(((arah + lebar / 2) % 360) / lebar).astype(int)) % n_sektor
+    for (a, b), nama in zip(KELAS_ANGIN, LABEL_KELAS):
+        m = (kec >= a) & (kec < b)
+        tabel[nama] = np.bincount(sektor[m], minlength=n_sektor) / total * 100
+    tenang = float((kec < TENANG).sum() / total * 100)
+    return tabel, tenang, total
+
+
+def gambar_windrose(tabel: pd.DataFrame, judul=""):
+    import plotly.graph_objects as go
+
+    n = len(tabel)
+    sudut = [k * 360 / n for k in range(n)]
+    fig = go.Figure()
+    for nama, warna in zip(tabel.columns, WARNA_KELAS):
+        if tabel[nama].sum() <= 0:
+            continue
+        fig.add_trace(go.Barpolar(
+            r=tabel[nama].values, theta=sudut, width=[360 / n * 0.92] * n,
+            name=f"{nama} m/s", marker_color=warna, marker_line_width=0,
+            customdata=tabel.index,
+            hovertemplate="%{customdata}: %{r:.2f}%<extra>" + nama + " m/s</extra>"))
+    fig.update_layout(
+        title=judul, height=520, margin=dict(t=60, b=30, l=30, r=30),
+        legend=dict(title="Kecepatan", orientation="v"),
+        polar=dict(
+            bargap=0,
+            angularaxis=dict(direction="clockwise", rotation=90, tickmode="array",
+                             tickvals=sudut, ticktext=list(tabel.index)),
+            radialaxis=dict(ticksuffix="%", angle=90, tickangle=90),
+        ),
+    )
+    return fig
 
 
 # --------------------------------------------------------------------------
@@ -538,6 +909,101 @@ def buat_excel(h: Hasil, sertakan_mentah=False) -> bytes:
     for kol, w in zip("ABCDEFG", [46, 10, 13, 13, 13, 13, 13]):
         wr.column_dimensions[kol].width = w
 
+    # ---- Sheet Windrose (formula COUNTIFS dari sheet Data)
+    ww = None
+    if h.angin:
+        ww = wb.create_sheet("Windrose")
+        n_kls = len(KELAS_ANGIN)
+        kol_total = 4 + n_kls                       # kolom "Total"
+        r = 1
+        for a in h.angin:
+            kec = f"Data!${huruf[a['kec']]}$2:${huruf[a['kec']]}${n_akhir}"
+            arah = f"Data!${huruf[a['arah']]}$2:${huruf[a['arah']]}${n_akhir}"
+
+            ww.cell(r, 1, f"Windrose {a['nama']}").style = "label"
+            ww.row_dimensions[r].height = 22
+            r += 1
+            ww.cell(r, 1, "Jumlah data").style = "teks"
+            sel_n = ww.cell(r, 2, f"=COUNT({kec})")
+            sel_n.style = "angka"
+            sel_n.number_format = "0"
+            ref_n = f"$B${r}"
+            ww.row_dimensions[r].height = 18
+            r += 2
+
+            # Header: nama kelas, lalu batas bawah dan atas kecepatan (m/s)
+            baris_h, baris_lo, baris_hi = r, r + 1, r + 2
+            for c, t in enumerate(["Arah", "Dari (°)", "Sampai (°)"], start=1):
+                ww.cell(baris_h, c, t).style = "th_k"
+                ww.cell(baris_lo, c, "Kecepatan dari (m/s)" if c == 1 else None).style = "teks_k" if c == 1 else "strip_k"
+                ww.cell(baris_hi, c, "Kecepatan sampai (m/s)" if c == 1 else None).style = "teks_k" if c == 1 else "strip_k"
+            for k, ((lo, hi), lab) in enumerate(zip(KELAS_ANGIN, LABEL_KELAS)):
+                c = 4 + k
+                ww.cell(baris_h, c, f"{lab} m/s").style = "th_k"
+                ww.cell(baris_lo, c, lo).style = "angka_k"
+                ww.cell(baris_hi, c, 999 if np.isinf(hi) else hi).style = "angka_k"
+                ww.cell(baris_lo, c).number_format = ww.cell(baris_hi, c).number_format = "0.0"
+            ww.cell(baris_h, kol_total, "Total").style = "th_k"
+            ww.cell(baris_lo, kol_total).style = "strip_k"
+            ww.cell(baris_hi, kol_total).style = "strip_k"
+            for rr, tinggi in ((baris_h, 30), (baris_lo, 18), (baris_hi, 18)):
+                ww.row_dimensions[rr].height = tinggi
+
+            # 16 sektor arah. Sektor utara melewati 360°, jadi dihitung dua bagian.
+            awal = baris_hi + 1
+            label16 = SEKTOR[16]
+            for s_idx, lab in enumerate(label16):
+                rr = awal + s_idx
+                dari = (s_idx * 22.5 - 11.25) % 360
+                sampai = (s_idx * 22.5 + 11.25) % 360
+                ww.cell(rr, 1, lab).style = "teks_k"
+                ww.cell(rr, 2, dari).style = "angka_k"
+                ww.cell(rr, 3, sampai).style = "angka_k"
+                for k in range(n_kls):
+                    c = 4 + k
+                    col = get_column_letter(c)
+                    lo, hi = f"{col}${baris_lo}", f"{col}${baris_hi}"
+                    syarat_kec = f'{kec},">="&{lo},{kec},"<"&{hi}'
+                    f = (f'=IF({ref_n}=0,0,IF($B{rr}<$C{rr},'
+                         f'COUNTIFS({arah},">="&$B{rr},{arah},"<"&$C{rr},{syarat_kec}),'
+                         f'COUNTIFS({arah},">="&$B{rr},{syarat_kec})+COUNTIFS({arah},"<"&$C{rr},{syarat_kec}))/{ref_n})')
+                    ww.cell(rr, c, f).style = "persen_k"
+                ww.cell(rr, kol_total,
+                        f"=SUM({get_column_letter(4)}{rr}:{get_column_letter(3 + n_kls)}{rr})").style = "persen_k"
+                ww.row_dimensions[rr].height = 18
+
+            akhir = awal + len(label16) - 1
+            rr = akhir + 1
+            ww.cell(rr, 1, "Jumlah per kelas").style = "th_k"
+            ww.cell(rr, 2).style = "strip_k"
+            ww.cell(rr, 3).style = "strip_k"
+            for c in range(4, kol_total + 1):
+                col = get_column_letter(c)
+                ww.cell(rr, c, f"=SUM({col}{awal}:{col}{akhir})").style = "persen_k"
+            ww.row_dimensions[rr].height = 20
+            rr += 1
+            ww.cell(rr, 1, f"Tenang (< {TENANG:g} m/s)".replace(".", ",")).style = "teks_k"
+            ww.cell(rr, 2).style = "strip_k"
+            ww.cell(rr, 3).style = "strip_k"
+            for c in range(4, kol_total):
+                ww.cell(rr, c).style = "strip_k"
+            ww.cell(rr, kol_total,
+                    f'=IF({ref_n}=0,0,COUNTIFS({kec},"<"&{get_column_letter(4)}${baris_lo})/{ref_n})').style = "persen_k"
+            ww.row_dimensions[rr].height = 18
+            rr += 1
+            ww.cell(rr, 1, "Total").style = "th_k"
+            for c in range(2, kol_total):
+                ww.cell(rr, c).style = "strip_k"
+            ww.cell(rr, kol_total, f"={get_column_letter(kol_total)}{rr - 2}+{get_column_letter(kol_total)}{rr - 1}").style = "persen_k"
+            ww.row_dimensions[rr].height = 20
+            r = rr + 3
+
+        ww.cell(r - 2, 1, "Persentase dihitung dari seluruh data. Arah = arah datangnya angin, "
+                          "batas sektor: dari ≤ arah < sampai.").font = Font(name=FONT, size=8, color="FF7F7F7F")
+        ww.column_dimensions["A"].width = 24
+        for c in range(2, kol_total + 1):
+            ww.column_dimensions[get_column_letter(c)].width = 12
+
     # ---- Sheet Info
     wi = wb.create_sheet("Info")
     baris_info = [
@@ -602,7 +1068,7 @@ def buat_excel(h: Hasil, sertakan_mentah=False) -> bytes:
     for kol, w in zip("ABCDEFG", [36, 28, 48, 13, 13, 12, 15]):
         wi.column_dimensions[kol].width = w
 
-    for lembar in (wr, wi):
+    for lembar in [x for x in (wr, wi, ww) if x is not None]:
         lembar.page_setup.orientation = "landscape"
         lembar.page_setup.fitToWidth = 1
         lembar.page_setup.fitToHeight = 0
@@ -693,16 +1159,19 @@ def main():
                     st.warning("Isi path file dulu.")
                     st.stop()
 
-            with st.spinner("Membaca GRIB dan menerjemahkan variabel..."):
-                hasil = proses(daftar, float(lat), float(lon), zona, mode_label[mode], lewati)
-                xlsx = buat_excel(hasil, mentah)
+            bar = st.progress(0.0, text="Mulai membaca GRIB...")
+            hasil = proses(daftar, float(lat), float(lon), zona, mode_label[mode], lewati,
+                           kabar=lambda fr, teks: bar.progress(min(fr, 1.0) * 0.9, text=teks))
+            bar.progress(0.92, text="Menulis Excel...")
+            xlsx = buat_excel(hasil, mentah)
+            bar.empty()
             st.session_state["hasil"] = hasil
             st.session_state["xlsx"] = xlsx
         except Exception as e:  # noqa: BLE001
             pesan = str(e)
             st.error(f"Gagal memproses file: {pesan}")
             if "eccodes" in pesan.lower() or "ecCodes" in pesan:
-                st.info("Library ecCodes belum terpasang. Coba: conda install -c conda-forge cfgrib")
+                st.info("Library ecCodes belum terpasang. Coba: pip install eccodes")
             st.stop()
         finally:
             for p in sementara:
@@ -739,16 +1208,75 @@ def main():
     st.map(peta, latitude="lat", longitude="lon", color="warna", size=600, zoom=8)
     st.caption("Merah: koordinat input. Biru: grid yang dipakai.")
 
+    nama_file = f"era5_{hasil.lat_input:.3f}_{hasil.lon_input:.3f}.xlsx".replace("-", "m")
+
+    # ---------------- Grafik deret waktu
+    angka = [c for c, j in hasil.jenis.items() if j not in ("teks", "arah")]
+    if angka:
+        st.subheader("Grafik deret waktu")
+        auto = resolusi_otomatis(hasil.data.index)
+        c1, c2 = st.columns([2, 1])
+        nama = c1.selectbox("Variabel", angka)
+        opsi = [f"Otomatis ({auto.lower()})"] + list(RESOLUSI)
+        pilih_res = c2.selectbox("Resolusi", opsi)
+        res = auto if pilih_res.startswith("Otomatis") else pilih_res
+
+        jenis = hasil.jenis[nama]
+        df = agregasi(hasil.data[nama], jenis, res)
+        if res == "Per jam" and len(df) > 20000:
+            st.caption(f"{len(df):,} titik per jam, grafik mungkin berat di browser.".replace(",", "."))
+        st.altair_chart(grafik_deret(df, nama, hasil.satuan[nama], jenis, res), width="stretch")
+
+        ket = []
+        if res != "Per jam":
+            ket.append("Garis: total per periode." if jenis == "jumlah"
+                       else "Garis: rata-rata per periode. Pita: rentang persentil 10-90 (80% data berada di dalamnya).")
+            kurang = df.loc[df["kelengkapan"] < 0.9, "label"].tolist()
+            if kurang:
+                daftar = ", ".join(kurang[:6]) + (f", dan {len(kurang) - 6} lainnya" if len(kurang) > 6 else "")
+                ket.append(f"Periode dengan data belum lengkap (ditandai segitiga/batang pucat): {daftar}.")
+        if ket:
+            st.caption(" ".join(ket))
+
+    # ---------------- Windrose
+    if hasil.angin:
+        st.subheader("Windrose")
+        idx = hasil.data.index
+        opsi_periode = (["Semua data"] + list(MUSIM) + NAMA_BULAN
+                        + [f"Tahun {t}" for t in sorted(set(idx.year))])
+        c1, c2, c3 = st.columns([2, 2, 1])
+        if len(hasil.angin) > 1:
+            pilih_angin = c1.selectbox("Ketinggian/level", [a["nama"] for a in hasil.angin])
+        else:
+            pilih_angin = hasil.angin[0]["nama"]
+            c1.text_input("Ketinggian/level", pilih_angin, disabled=True)
+        a = next(x for x in hasil.angin if x["nama"] == pilih_angin)
+        periode = c2.selectbox("Periode", opsi_periode,
+                               help="Musim mengikuti pembagian DJF/MAM/JJA/SON. Bulan dan tahun memakai zona waktu yang dipilih.")
+        n_sektor = c3.radio("Sektor", [16, 8], horizontal=True)
+
+        mask = saring_periode(idx, periode)
+        tabel, tenang, n = tabel_windrose(hasil.data.loc[mask, a["kec"]], hasil.data.loc[mask, a["arah"]], n_sektor)
+        if n == 0:
+            st.info("Tidak ada data angin pada periode ini.")
+        else:
+            judul = f"Windrose {a['nama']}, {periode.lower() if periode == 'Semua data' else periode}"
+            st.plotly_chart(gambar_windrose(tabel, judul), width="stretch")
+            per_arah = tabel.sum(axis=1)
+            kec_rata = hasil.data.loc[mask, a["kec"]].mean()
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Arah dominan", per_arah.idxmax(), f"{per_arah.max():.1f}% kejadian", delta_color="off")
+            m2.metric("Kecepatan rata-rata", f"{kec_rata:.2f} m/s")
+            m3.metric("Angin tenang (< 0,5 m/s)", f"{tenang:.1f}%")
+            m4.metric("Jumlah data", f"{n:,}".replace(",", "."))
+            st.caption("Arah menunjukkan dari mana angin datang. Panjang batang = persentase kejadian dari seluruh "
+                       "data di periode ini; angin tenang tidak punya arah sehingga tidak masuk batang. "
+                       "Gambar bisa disimpan lewat ikon kamera di pojok kanan atas grafik. "
+                       "Tabel windrose lengkap ada di sheet Windrose pada file Excel.")
+
     st.subheader("Pratinjau data")
     st.dataframe(hasil.data.head(500), width="stretch")
 
-    angka = [c for c, j in hasil.jenis.items() if j not in ("teks", "arah")]
-    if angka:
-        pilih = st.multiselect("Tampilkan grafik", angka, default=angka[:1])
-        if pilih:
-            st.line_chart(hasil.data[pilih])
-
-    nama_file = f"era5_{hasil.lat_input:.3f}_{hasil.lon_input:.3f}.xlsx".replace("-", "m")
     st.download_button("Unduh Excel", st.session_state["xlsx"], file_name=nama_file,
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                        type="primary")
