@@ -623,7 +623,7 @@ RESOLUSI = {"Per jam": None, "Per hari": "D", "Per bulan": "MS", "Per tahun": "Y
 TENANG = 0.5
 KELAS_ANGIN = [(0.5, 2.1), (2.1, 3.6), (3.6, 5.7), (5.7, 8.8), (8.8, 11.1), (11.1, np.inf)]
 LABEL_KELAS = ["0,5-2,1", "2,1-3,6", "3,6-5,7", "5,7-8,8", "8,8-11,1", "≥ 11,1"]
-WARNA_KELAS = ["#c6dbef", "#6baed6", "#2171b5", "#fdae6b", "#e6550d", "#a63603"]
+WARNA_KELAS = ["#8cc5e3", "#3a8fc7", "#0b4f8a", "#fdae6b", "#e6550d", "#a63603"]
 SEKTOR = {
     16: ["U", "UTL", "TL", "TTL", "T", "TTG", "TG", "STG", "S", "SBD", "BD", "BBD", "B", "BBL", "BL", "UBL"],
     8: ["U", "TL", "T", "TG", "S", "BD", "B", "BL"],
@@ -1015,10 +1015,17 @@ def _zoom_untuk(lat, lebar_km, lebar_px, ukuran_tile):
     return float(np.log2(keliling / (ukuran_tile * m_per_px)))
 
 
-def gambar_windrose_peta(tabel, lat0, lon0, lat_in, lon_in, radius_km, tujuan, peta_dasar, judul=""):
-    """Windrose interaktif (Plotly) di atas peta, berpusat di grid data."""
+def _rgba(hex_warna, alpha):
+    h = hex_warna.lstrip("#")
+    return f"rgba({int(h[0:2], 16)},{int(h[2:4], 16)},{int(h[4:6], 16)},{alpha:.2f})"
+
+
+def gambar_windrose_peta(tabel, lat0, lon0, lat_g, lon_g, radius_km, tujuan, peta_dasar, judul="", opasitas=0.6):
+    """Windrose interaktif (Plotly) di atas peta, berpusat di koordinat input (lat0, lon0).
+    (lat_g, lon_g) = grid data asal nilai, ditandai titik hitam. opasitas 0-1 untuk kelopak."""
     import plotly.graph_objects as go
 
+    lon0 = (lon0 + 540) % 360 - 180
     kelas, cincin = bentuk_kelopak(tabel, lat0, lon0, radius_km, tujuan)
     fig = go.Figure()
     for c in cincin:
@@ -1026,8 +1033,9 @@ def gambar_windrose_peta(tabel, lat0, lon0, lat_in, lon_in, radius_km, tujuan, p
                                     line=dict(width=1, color="rgba(60,60,60,0.55)"), showlegend=False))
     for kls in kelas:
         fig.add_trace(go.Scattermap(lat=kls["lat"], lon=kls["lon"], mode="lines", fill="toself",
-                                    fillcolor=kls["warna"], line=dict(width=0.6, color="white"),
-                                    name=f"{kls['nama']} m/s", hoverinfo="skip", opacity=0.9))
+                                    fillcolor=_rgba(kls["warna"], opasitas),
+                                    line=dict(width=1, color="rgba(30,30,30,0.75)"),
+                                    name=f"{kls['nama']} m/s", hoverinfo="skip"))
 
     # Info saat disorot: titik di ujung tiap kelopak
     n = len(tabel)
@@ -1046,13 +1054,12 @@ def gambar_windrose_peta(tabel, lat0, lon0, lat_in, lon_in, radius_km, tujuan, p
         fig.add_trace(go.Scattermap(lat=[c["lat"][0]], lon=[c["lon"][0]], mode="text",
                                     text=[f"{c['persen']:g}%"], textposition="top center",
                                     textfont=dict(size=11, color="#333333"), hoverinfo="skip", showlegend=False))
-    fig.add_trace(go.Scattermap(lat=[lat0], lon=[lon0], mode="markers", name="Grid data",
-                                marker=dict(size=9, color="#111111"),
-                                hovertemplate=f"Grid data<br>{lat0:.2f}, {lon0:.2f}<extra></extra>"))
-    lon_in_n = (lon_in + 540) % 360 - 180
-    fig.add_trace(go.Scattermap(lat=[lat_in], lon=[lon_in_n], mode="markers", name="Koordinat input",
-                                marker=dict(size=11, color="#d62728"),
-                                hovertemplate=f"Koordinat input<br>{lat_in:.4f}, {lon_in_n:.4f}<extra></extra>"))
+    fig.add_trace(go.Scattermap(lat=[lat_g], lon=[lon_g], mode="markers", name="Grid data (asal nilai)",
+                                marker=dict(size=8, color="#111111"),
+                                hovertemplate=f"Grid data ERA5<br>{lat_g:.2f}, {lon_g:.2f}<extra></extra>"))
+    fig.add_trace(go.Scattermap(lat=[lat0], lon=[lon0], mode="markers", name="Koordinat input",
+                                marker=dict(size=12, color="#d62728"),
+                                hovertemplate=f"Koordinat input<br>{lat0:.4f}, {lon0:.4f}<extra></extra>"))
 
     gaya = PETA_DASAR.get(peta_dasar, PETA_DASAR["Peta jalan"])
     if peta_dasar == "Citra satelit":
@@ -1126,13 +1133,16 @@ def ambil_peta_dasar(lat0, lon0, lebar_km, peta_dasar="Peta jalan", target_px=10
     return gambar, lokal, km_per_px
 
 
-def png_windrose_peta(tabel, lat0, lon0, lat_in, lon_in, radius_km, tujuan, peta_dasar,
-                      judul, catatan, pengambil=None) -> bytes:
-    """Versi gambar windrose di atas peta, lengkap dengan arah utara, skala, dan atribusi peta."""
+def png_windrose_peta(tabel, lat0, lon0, lat_g, lon_g, radius_km, tujuan, peta_dasar,
+                      judul, catatan, opasitas=0.6, pengambil=None) -> bytes:
+    """Versi gambar windrose di atas peta, berpusat di koordinat input (lat0, lon0),
+    lengkap dengan arah utara, skala, dan atribusi peta."""
     plt = _gaya_mpl()
+    from matplotlib.colors import to_rgba
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
 
+    lon0 = (lon0 + 540) % 360 - 180
     lebar_km = radius_km * 2.8
     peta = ambil_peta_dasar(lat0, lon0, lebar_km, peta_dasar, pengambil=pengambil)
     fig, ax = plt.subplots(figsize=(9, 9))
@@ -1167,16 +1177,17 @@ def png_windrose_peta(tabel, lat0, lon0, lat_in, lon_in, radius_km, tujuan, peta
             if la is None:
                 if bagian_lat:
                     x, y = lokal(bagian_lat, bagian_lon)
-                    ax.fill(x, y, color=kls["warna"], alpha=0.88, ec="white", lw=0.6, zorder=3)
+                    ax.fill(x, y, fc=to_rgba(kls["warna"], opasitas), ec=(0.12, 0.12, 0.12, 0.75), lw=0.7,
+                            zorder=3)
                 bagian_lat, bagian_lon = [], []
             else:
                 bagian_lat.append(la)
                 bagian_lon.append(lo)
 
-    gx, gy = lokal(lat0, lon0)
-    ix, iy = lokal(lat_in, (lon_in + 540) % 360 - 180)
-    ax.scatter([gx], [gy], s=28, color="#111111", zorder=6)
-    ax.scatter([ix], [iy], s=60, color="#d62728", edgecolor="white", linewidth=1, zorder=6)
+    gx, gy = lokal(lat_g, lon_g)
+    ix, iy = lokal(lat0, lon0)
+    ax.scatter([gx], [gy], s=24, color="#111111", edgecolor="white", linewidth=0.8, zorder=6)
+    ax.scatter([ix], [iy], s=70, color="#d62728", edgecolor="white", linewidth=1.2, zorder=7)
 
     ax.set_xlim(0, lebar_px)
     ax.set_ylim(lebar_px, 0)
@@ -1202,8 +1213,9 @@ def png_windrose_peta(tabel, lat0, lon0, lat_in, lon_in, radius_km, tujuan, peta
     ax.text(0.995, 0.005, atribusi, transform=ax.transAxes, ha="right", va="bottom", fontsize=7, color="#333333",
             zorder=7, bbox=dict(boxstyle="square,pad=0.2", fc="white", ec="none", alpha=0.75))
 
-    pegangan = [Patch(color=k["warna"], label=f"{k['nama']} m/s") for k in kelas]
-    pegangan += [Line2D([], [], marker="o", ls="", color="#111111", label="Grid data"),
+    pegangan = [Patch(fc=to_rgba(k["warna"], max(opasitas, 0.5)), ec=(0.12, 0.12, 0.12, 0.75), lw=0.7,
+                      label=f"{k['nama']} m/s") for k in kelas]
+    pegangan += [Line2D([], [], marker="o", ls="", color="#111111", label="Grid data (asal nilai)"),
                  Line2D([], [], marker="o", ls="", color="#d62728", markeredgecolor="white", label="Koordinat input")]
     ax.legend(handles=pegangan, title="Kecepatan", loc="upper right", fontsize=8, title_fontsize=9,
               framealpha=0.9)
@@ -1794,7 +1806,7 @@ def main():
 
                 with tab_peta:
                     g = grid_untuk(hasil, a["kec"])
-                    c1, c2, c3 = st.columns([2, 2, 2])
+                    c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
                     tampil = c1.radio("Kelopak menunjukkan", ["Arah datang angin", "Arah tujuan angin"],
                                       key=f"tujuan_{pid}",
                                       help="Windrose standar menunjukkan dari mana angin datang. Pilih arah tujuan "
@@ -1804,9 +1816,11 @@ def main():
                     radius = c3.slider("Panjang kelopak terpanjang (km)", 2, 200, 30, key=f"radius_{pid}",
                                        help="Hanya skala gambar. Panjang kelopak sebanding dengan persentase "
                                             "kejadian, bukan jarak tempuh angin.")
+                    opasitas = c4.slider("Kepekatan kelopak (%)", 10, 100, 55, step=5, key=f"opasitas_{pid}",
+                                         help="Kecilkan supaya peta di bawahnya lebih terlihat.") / 100
                     st.plotly_chart(
-                        gambar_windrose_peta(tabel, g.lat_grid, g.lon_grid, hasil.lat_input, hasil.lon_input,
-                                             radius, tujuan, peta_dasar),
+                        gambar_windrose_peta(tabel, hasil.lat_input, hasil.lon_input, g.lat_grid, g.lon_grid,
+                                             radius, tujuan, peta_dasar, opasitas=opasitas),
                         width="stretch")
                     dominan = per_arah.idxmax()
                     ke = tabel.index[(list(tabel.index).index(dominan) + len(tabel) // 2) % len(tabel)]
@@ -1814,17 +1828,18 @@ def main():
                         ("Kelopak menunjuk ke arah angin bertiup. " if tujuan
                          else "Kelopak menunjuk ke arah datangnya angin (standar windrose). ")
                         + f"Angin paling sering datang dari {dominan} dan bertiup ke {ke}. "
-                        + "Kelopak berpusat di grid data (titik hitam); titik merah adalah koordinat input. "
+                        + "Windrose berpusat di koordinat input (titik merah). Nilainya diambil dari grid ERA5 "
+                        + f"terdekat (titik hitam, {_angka_id(g.jarak_km, 1)} km dari input). "
                         + "Data ERA5 mewakili rata-rata satu kotak grid, jadi efek lokal seperti angin darat-laut "
                           "skala kecil atau bangunan tidak tergambar.")
-                    catatan = (catatan_sumber(hasil, a["kec"]) + "\n"
+                    catatan = (catatan_sumber(hasil, a["kec"]) + " Windrose berpusat di koordinat input.\n"
                                + ("Kelopak menunjukkan arah tujuan angin (ke mana angin bertiup). " if tujuan
                                   else "Kelopak menunjukkan arah datang angin. ")
                                + ringkas)
                     def png_peta(tabel=tabel, g=g, radius=radius, tujuan=tujuan, peta_dasar=peta_dasar,
-                                 judul=f"Windrose {a['nama']}\n{keterangan}", catatan=catatan):
-                        return png_windrose_peta_c(tabel, g.lat_grid, g.lon_grid, hasil.lat_input,
-                                                   hasil.lon_input, radius, tujuan, peta_dasar, judul, catatan)
+                                 judul=f"Windrose {a['nama']}\n{keterangan}", catatan=catatan, opasitas=opasitas):
+                        return png_windrose_peta_c(tabel, hasil.lat_input, hasil.lon_input, g.lat_grid,
+                                                   g.lon_grid, radius, tujuan, peta_dasar, judul, catatan, opasitas)
                     st.download_button("Unduh windrose di peta (PNG)", png_peta, key=f"dl_wrp_{pid}",
                                        file_name=f"windrose_peta_{_slug(a['nama'])}_{slug_rentang}"
                                                  + ("" if periode == semua else f"_{_slug(periode)}")
