@@ -21,6 +21,7 @@ Alur:
 
 from __future__ import annotations
 
+import functools
 import io
 import os
 import tempfile
@@ -1179,16 +1180,33 @@ def png_windrose(tabel: pd.DataFrame, judul: str, catatan: str, tenang=None) -> 
 # --------------------------------------------------------------------------
 # Windrose di atas peta
 # --------------------------------------------------------------------------
+# Peta dasar yang bisa diambil langsung tanpa API key. Lapisan pertama = dasar,
+# lapisan berikutnya = label transparan yang ditumpuk di atasnya.
+# CARTO tidak dipakai lagi karena sekarang mewajibkan API key untuk akses tile.
+_ESRI = "https://server.arcgisonline.com/ArcGIS/rest/services"
 PETA_DASAR = {
+    "Peta abu-abu": {
+        "lapisan": [f"{_ESRI}/Canvas/World_Light_Gray_Base/MapServer/tile/{{z}}/{{y}}/{{x}}",
+                    f"{_ESRI}/Canvas/World_Light_Gray_Reference/MapServer/tile/{{z}}/{{y}}/{{x}}"],
+        "atribusi": "Tiles © Esri: Esri, HERE, Garmin, © OpenStreetMap contributors",
+        "maks_zoom": 16,
+        "cadangan": "Peta jalan",
+    },
     "Peta jalan": {
-        "url": "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
-        "atribusi": "© OpenStreetMap contributors © CARTO",
+        "lapisan": ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+        "atribusi": "© OpenStreetMap contributors",
+        "maks_zoom": 19,
+        "cadangan": None,
     },
     "Citra satelit": {
-        "url": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-        "atribusi": "Tiles © Esri, Maxar, Earthstar Geographics",
+        "lapisan": [f"{_ESRI}/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}",
+                    f"{_ESRI}/Reference/World_Boundaries_and_Places/MapServer/tile/{{z}}/{{y}}/{{x}}"],
+        "atribusi": "Tiles © Esri: Maxar, Earthstar Geographics, GIS User Community",
+        "maks_zoom": 18,
+        "cadangan": "Peta abu-abu",
     },
 }
+PETA_DASAR_BAWAAN = "Peta abu-abu"
 
 
 def titik_tujuan(lat, lon, arah_deg, jarak_km):
@@ -1302,12 +1320,11 @@ def gambar_windrose_peta(tabel, lat0, lon0, lat_g, lon_g, radius_km, tujuan, pet
                                 marker=dict(size=12, color="#d62728"),
                                 hovertemplate=f"Koordinat input<br>{lat0:.4f}, {lon0:.4f}<extra></extra>"))
 
-    gaya = PETA_DASAR.get(peta_dasar, PETA_DASAR["Peta jalan"])
-    if peta_dasar == "Citra satelit":
-        peta = dict(style="white-bg", layers=[dict(below="traces", sourcetype="raster",
-                                                   sourceattribution=gaya["atribusi"], source=[gaya["url"]])])
-    else:
-        peta = dict(style="carto-positron")
+    gaya = PETA_DASAR.get(peta_dasar, PETA_DASAR[PETA_DASAR_BAWAAN])
+    peta = dict(style="white-bg", layers=[
+        dict(below="traces", sourcetype="raster", source=[url],
+             sourceattribution=gaya["atribusi"] if k == 0 else None)
+        for k, url in enumerate(gaya["lapisan"])])
     peta.update(center=dict(lat=lat0, lon=lon0), zoom=_zoom_untuk(lat0, radius_km * 2.8, 640, 512))
     fig.update_layout(map=peta, height=640, margin=dict(t=50 if judul else 10, b=10, l=10, r=10),
                       title=judul, legend=dict(title="Kecepatan", bgcolor="rgba(255,255,255,0.85)",
@@ -1315,63 +1332,107 @@ def gambar_windrose_peta(tabel, lat0, lon0, lat_g, lon_g, radius_km, tujuan, pet
     return fig
 
 
-def _tile(url_pola, z, x, y):
-    """Ambil satu tile peta (PNG/JPG). Mengembalikan gambar PIL atau None."""
+@functools.lru_cache(maxsize=1024)
+def _unduh_tile(url: str):
+    """Unduh satu tile (bytes), disimpan di memori supaya tidak diunduh berulang."""
     import urllib.request
-    from PIL import Image
-
-    n = 2 ** z
-    url = url_pola.format(s="abcd"[(x + y) % 4], z=z, x=x % n, y=y)
-    req = urllib.request.Request(url, headers={"User-Agent": "analisis-titik-era5/1.0 (aplikasi Streamlit)"})
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "AnalisisTitikERA5/1.0 (aplikasi Streamlit pengolah data ERA5)",
+        "Referer": "https://streamlit.app/",
+    })
     try:
         with urllib.request.urlopen(req, timeout=8) as r:
-            return Image.open(io.BytesIO(r.read())).convert("RGB")
+            return r.read()
     except Exception:  # noqa: BLE001
         return None
 
 
-def ambil_peta_dasar(lat0, lon0, lebar_km, peta_dasar="Peta jalan", target_px=1000, pengambil=None):
-    """Susun peta dasar persegi berpusat di (lat0, lon0) selebar lebar_km.
-    Mengembalikan (gambar PIL, fungsi lat/lon -> piksel, km per piksel) atau None kalau gagal."""
+def _tile(url_pola, z, x, y):
+    """Ambil satu tile peta. Mengembalikan gambar PIL (RGBA) atau None."""
+    from PIL import Image
+
+    n = 2 ** z
+    isi = _unduh_tile(url_pola.format(z=z, x=x % n, y=y))
+    if not isi:
+        return None
+    try:
+        return Image.open(io.BytesIO(isi)).convert("RGBA")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _susun_lapisan(pengambil, pola, z, daftar, tx, ty, latar):
+    """Ambil semua tile satu lapisan lalu susun jadi satu kanvas RGBA.
+    Mengembalikan None kalau tidak ada tile, atau kalau semua tile identik dan
+    bergambar (tanda server mengirim gambar pengganti seperti 'API KEY REQUIRED')."""
     from concurrent.futures import ThreadPoolExecutor
     from PIL import Image
 
-    pengambil = pengambil or _tile
-    pola = PETA_DASAR.get(peta_dasar, PETA_DASAR["Peta jalan"])["url"]
-    z = int(np.clip(np.floor(_zoom_untuk(lat0, lebar_km, target_px, 256)), 2, 17))
-    skala = 256 * 2 ** z
-
-    def ke_px(lat, lon):
-        lat = np.clip(np.asarray(lat, dtype=float), -85, 85)
-        x = (np.asarray(lon, dtype=float) + 180) / 360 * skala
-        y = (1 - np.log(np.tan(np.radians(lat)) + 1 / np.cos(np.radians(lat))) / np.pi) / 2 * skala
-        return x, y
-
-    cx, cy = ke_px(lat0, lon0)
-    km_per_px = 40075.016686 * np.cos(np.radians(lat0)) / skala
-    setengah = lebar_km / 2 / km_per_px
-    x0, x1, y0, y1 = cx - setengah, cx + setengah, cy - setengah, cy + setengah
-    tx = range(int(np.floor(x0 / 256)), int(np.floor(x1 / 256)) + 1)
-    ty = range(max(int(np.floor(y0 / 256)), 0), min(int(np.floor(y1 / 256)), 2 ** z - 1) + 1)
-    daftar = [(x, y) for y in ty for x in tx]
-    if len(daftar) > 64:
-        return None
     with ThreadPoolExecutor(max_workers=8) as ex:
         hasil = list(ex.map(lambda t: pengambil(pola, z, t[0], t[1]), daftar))
-    if not any(h is not None for h in hasil):
+    ada = [h for h in hasil if h is not None]
+    if not ada:
         return None
-    kanvas = Image.new("RGB", (len(tx) * 256, len(ty) * 256), (235, 235, 235))
+    if latar is None and len(ada) >= 3 and len({h.tobytes() for h in ada}) == 1:
+        # Semua tile sama persis. Kalau polos (misalnya laut lepas), itu wajar.
+        # Kalau ada gambar/tulisan, itu tile pengganti dari server, anggap gagal.
+        from PIL import ImageStat
+        if ImageStat.Stat(ada[0].convert("L")).stddev[0] > 3:
+            return None
+    kanvas = Image.new("RGBA", (len(tx) * 256, len(ty) * 256), (235, 235, 235, 255) if latar is None else (0, 0, 0, 0))
     for (x, y), img in zip(daftar, hasil):
         if img is not None:
-            kanvas.paste(img.resize((256, 256)), ((x - tx[0]) * 256, (y - ty[0]) * 256))
-    kiri, atas = int(round(x0 - tx[0] * 256)), int(round(y0 - ty[0] * 256))
-    sisi = int(round(2 * setengah))
-    gambar = kanvas.crop((kiri, atas, kiri + sisi, atas + sisi))
+            kanvas.paste(img.convert("RGBA").resize((256, 256)), ((x - tx[0]) * 256, (y - ty[0]) * 256))
+    return kanvas
 
-    def lokal(lat, lon):
-        x, y = ke_px(lat, lon)
-        return x - x0, y - y0
-    return gambar, lokal, km_per_px
+
+def ambil_peta_dasar(lat0, lon0, lebar_km, peta_dasar=PETA_DASAR_BAWAAN, target_px=1000, pengambil=None):
+    """Susun peta dasar persegi berpusat di (lat0, lon0) selebar lebar_km.
+    Kalau sumber yang dipilih gagal, otomatis mencoba sumber cadangannya.
+    Mengembalikan (gambar PIL, fungsi lat/lon -> piksel, km per piksel, atribusi) atau None."""
+    from PIL import Image
+
+    pengambil = pengambil or _tile
+    nama = peta_dasar if peta_dasar in PETA_DASAR else PETA_DASAR_BAWAAN
+    while nama:
+        gaya = PETA_DASAR[nama]
+        z = int(np.clip(np.floor(_zoom_untuk(lat0, lebar_km, target_px, 256)), 2, gaya["maks_zoom"]))
+        skala = 256 * 2 ** z
+
+        def ke_px(lat, lon, skala=skala):
+            lat = np.clip(np.asarray(lat, dtype=float), -85, 85)
+            x = (np.asarray(lon, dtype=float) + 180) / 360 * skala
+            y = (1 - np.log(np.tan(np.radians(lat)) + 1 / np.cos(np.radians(lat))) / np.pi) / 2 * skala
+            return x, y
+
+        cx, cy = ke_px(lat0, lon0)
+        km_per_px = 40075.016686 * np.cos(np.radians(lat0)) / skala
+        setengah = lebar_km / 2 / km_per_px
+        x0, x1, y0, y1 = cx - setengah, cx + setengah, cy - setengah, cy + setengah
+        tx = range(int(np.floor(x0 / 256)), int(np.floor(x1 / 256)) + 1)
+        ty = range(max(int(np.floor(y0 / 256)), 0), min(int(np.floor(y1 / 256)), 2 ** z - 1) + 1)
+        daftar = [(x, y) for y in ty for x in tx]
+        if len(daftar) > 64:
+            return None
+
+        dasar = _susun_lapisan(pengambil, gaya["lapisan"][0], z, daftar, tx, ty, latar=None)
+        if dasar is None:
+            nama = gaya.get("cadangan")
+            continue
+        for pola in gaya["lapisan"][1:]:
+            label = _susun_lapisan(pengambil, pola, z, daftar, tx, ty, latar=dasar)
+            if label is not None:
+                dasar = Image.alpha_composite(dasar, label)
+
+        kiri, atas = int(round(x0 - tx[0] * 256)), int(round(y0 - ty[0] * 256))
+        sisi = int(round(2 * setengah))
+        gambar = dasar.crop((kiri, atas, kiri + sisi, atas + sisi)).convert("RGB")
+
+        def lokal(lat, lon, ke_px=ke_px, x0=x0, y0=y0):
+            x, y = ke_px(lat, lon)
+            return x - x0, y - y0
+        return gambar, lokal, km_per_px, gaya["atribusi"]
+    return None
 
 
 def png_windrose_peta(tabel, lat0, lon0, lat_g, lon_g, radius_km, tujuan, peta_dasar,
@@ -1388,10 +1449,9 @@ def png_windrose_peta(tabel, lat0, lon0, lat_g, lon_g, radius_km, tujuan, peta_d
     peta = ambil_peta_dasar(lat0, lon0, lebar_km, peta_dasar, pengambil=pengambil)
     fig, ax = plt.subplots(figsize=(9, 9))
     if peta is not None:
-        gambar, lokal, km_per_px = peta
+        gambar, lokal, km_per_px, atribusi = peta
         ax.imshow(gambar, extent=(0, gambar.width, gambar.height, 0), zorder=0)
         lebar_px = gambar.width
-        atribusi = PETA_DASAR.get(peta_dasar, PETA_DASAR["Peta jalan"])["atribusi"]
     else:
         # Cadangan tanpa peta: proyeksi datar sederhana di sekitar titik
         lebar_px = 1000
@@ -2070,7 +2130,8 @@ def main():
                 with tab_peta:
                     g = grid_untuk(hasil, a["kec"])
                     c2, c3, c4 = st.columns([2, 2, 2])
-                    peta_dasar = c2.radio("Peta dasar", list(PETA_DASAR), key=f"basemap_{pid}")
+                    peta_dasar = c2.radio("Peta dasar", list(PETA_DASAR), key=f"basemap_{pid}",
+                                          help="Peta abu-abu paling netral sehingga warna kelopak mudah dibaca.")
                     radius = c3.slider("Panjang kelopak terpanjang (km)", 2, 200, 30, key=f"radius_{pid}",
                                        help="Hanya skala gambar. Panjang kelopak sebanding dengan persentase "
                                             "kejadian, bukan jarak tempuh angin.")
