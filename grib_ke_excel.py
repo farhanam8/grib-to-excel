@@ -682,8 +682,10 @@ def agregasi(s: pd.Series, jenis: str, resolusi: str) -> pd.DataFrame:
     harusnya = [(t + ofs - t) / langkah for t in df.index]
     df["kelengkapan"] = np.clip(df["n"].values / np.maximum(harusnya, 1), 0, 1)
 
-    fmt = {"D": "%Y-%m-%d", "MS": "%Y-%m", "YS": "%Y"}[frek]
-    df["label"] = df.index.strftime(fmt)
+    if frek == "MS":
+        df["label"] = [f"{NAMA_BULAN_PENDEK[t.month - 1]} {t.year}" for t in df.index]
+    else:
+        df["label"] = df.index.strftime({"D": "%Y-%m-%d", "YS": "%Y"}[frek])
     df.index.name = "waktu"
     return df.reset_index()[KOLOM_AGREGASI]
 
@@ -790,6 +792,173 @@ def gambar_windrose(tabel: pd.DataFrame, judul=""):
         ),
     )
     return fig
+
+
+NAMA_BULAN_PENDEK = ["Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"]
+
+
+def label_bulan(t) -> str:
+    return f"{NAMA_BULAN_PENDEK[t.month - 1]} {t.year}"
+
+
+def label_tanggal(t) -> str:
+    return f"{t.day} {NAMA_BULAN_PENDEK[t.month - 1]} {t.year}"
+
+
+def saring_rentang(index, mulai, akhir):
+    """Mask boolean untuk data dalam rentang [mulai, akhir], keduanya inklusif."""
+    return (index >= pd.Timestamp(mulai)) & (index <= pd.Timestamp(akhir))
+
+
+def _gaya_mpl():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    plt.rcParams.update({
+        "font.family": "DejaVu Sans", "font.size": 10,
+        "axes.spines.top": False, "axes.spines.right": False,
+        "axes.edgecolor": "#7f7f7f", "axes.labelcolor": "#333333",
+        "xtick.color": "#333333", "ytick.color": "#333333",
+    })
+    return plt
+
+
+def _simpan_png(fig, plt) -> bytes:
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=200, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def png_deret(df: pd.DataFrame, nama: str, satuan: str, jenis: str, resolusi: str,
+              judul: str, catatan: str) -> bytes:
+    """Versi gambar (PNG, latar putih) dari grafik deret waktu, siap untuk laporan."""
+    plt = _gaya_mpl()
+    import matplotlib.dates as mdates
+
+    warna, pucat = "#2171b5", "#9ecae1"
+    fig, ax = plt.subplots(figsize=(11, 4.8))
+    lengkap = (df["kelengkapan"] >= 0.9).values
+    kategori = resolusi in ("Per bulan", "Per tahun")
+    x = np.arange(len(df)) if kategori else pd.to_datetime(df["waktu"]).values
+
+    nama_pendek = nama.split(" (")[0]
+    if jenis == "jumlah" and (~lengkap).any():
+        catatan = catatan + "\nBatang pucat: data pada periode itu belum lengkap, sehingga totalnya lebih kecil dari seharusnya."
+    if jenis == "jumlah":
+        lebar = 0.8 if kategori else (0.8 if resolusi == "Per hari" else 0.8 / 24)
+        ax.bar(x, df["nilai"], width=lebar, color=[warna if k else pucat for k in lengkap])
+        ax.set_ylabel(f"Total {nama_pendek.lower()} ({satuan})" if resolusi != "Per jam" else f"{nama_pendek} ({satuan})")
+    elif resolusi == "Per jam":
+        ax.plot(x, df["nilai"], color=warna, lw=0.8)
+        ax.set_ylabel(f"{nama_pendek} ({satuan})")
+    else:
+        ax.fill_between(x, df["p10"], df["p90"], color=warna, alpha=0.18, lw=0, label="Persentil 10-90")
+        ax.plot(x, df["nilai"], color=warna, lw=2, label="Rata-rata")
+        if lengkap.any():
+            ax.scatter(np.asarray(x)[lengkap], df["nilai"].values[lengkap], color=warna, s=28, zorder=3)
+        if (~lengkap).any():
+            ax.scatter(np.asarray(x)[~lengkap], df["nilai"].values[~lengkap], marker="^", s=50, zorder=3,
+                       facecolor="white", edgecolor=warna, linewidth=1.5, label="Data belum lengkap")
+        ax.set_ylabel(f"Rata-rata {nama_pendek.lower()} ({satuan})")
+        ax.legend(loc="lower left", bbox_to_anchor=(0.0, 1.0), ncol=3, frameon=False, fontsize=9,
+                  borderaxespad=0.2, handlelength=1.8)
+
+    miring = kategori and resolusi == "Per bulan" and len(df) > 12
+    if kategori:
+        langkah = max(1, int(np.ceil(len(df) / 24)))
+        ax.set_xticks(x[::langkah])
+        ax.set_xticklabels(df["label"].values[::langkah], rotation=45 if miring else 0,
+                           ha="right" if miring else "center")
+        ax.set_xlim(-0.6, len(df) - 0.4)
+    else:
+        from matplotlib.ticker import FuncFormatter
+        waktu = pd.to_datetime(df["waktu"])
+        hari = (waktu.max() - waktu.min()) / pd.Timedelta(days=1) if len(waktu) else 0
+
+        def fmt(v, _):
+            t = mdates.num2date(v)
+            bln = NAMA_BULAN_PENDEK[t.month - 1]
+            if resolusi == "Per jam" and hari <= 3:
+                return f"{t:%H:%M}\n{t.day} {bln}"
+            if hari <= 150:
+                return f"{t.day} {bln}"
+            return f"{bln} {t.year}"
+        if resolusi == "Per hari" and hari <= 14:
+            ax.xaxis.set_major_locator(mdates.DayLocator())
+        else:
+            ax.xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=12))
+        ax.xaxis.set_major_formatter(FuncFormatter(fmt))
+    if jenis == "jumlah" or df["nilai"].min() >= 0:
+        ax.set_ylim(bottom=0)
+    ax.grid(axis="y", color="#d9d9d9", lw=0.6)
+    ax.set_axisbelow(True)
+    ax.set_title(judul, loc="left", fontsize=13, fontweight="bold",
+                 pad=30 if (jenis != "jumlah" and resolusi != "Per jam") else 12)
+    turun = -70 if miring else (-34 if kategori else (-48 if resolusi == "Per jam" and hari <= 3 else -36))
+    ax.annotate(catatan, xy=(0, 0), xycoords="axes fraction", xytext=(0, turun), textcoords="offset points",
+                fontsize=8, color="#7f7f7f", ha="left", va="top")
+    return _simpan_png(fig, plt)
+
+
+def png_windrose(tabel: pd.DataFrame, judul: str, catatan: str) -> bytes:
+    """Versi gambar (PNG, latar putih) dari windrose."""
+    plt = _gaya_mpl()
+    from matplotlib.ticker import FuncFormatter, MaxNLocator
+
+    n = len(tabel)
+    th = np.deg2rad(np.arange(n) * 360 / n)
+    fig = plt.figure(figsize=(9, 7.6))
+    ax = fig.add_subplot(projection="polar")
+    ax.set_theta_zero_location("N")
+    ax.set_theta_direction(-1)
+    bawah = np.zeros(n)
+    for nama, warna in zip(tabel.columns, WARNA_KELAS):
+        v = tabel[nama].values
+        if v.sum() <= 0:
+            continue
+        ax.bar(th, v, width=2 * np.pi / n * 0.92, bottom=bawah, color=warna,
+               edgecolor="white", linewidth=0.6, label=f"{nama} m/s", zorder=3)
+        bawah = bawah + v
+    ax.set_xticks(th)
+    ax.set_xticklabels(tabel.index, fontsize=10)
+    ax.yaxis.set_major_locator(MaxNLocator(4))
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}%"))
+    ax.set_rlabel_position(360 / n / 2)
+    ax.tick_params(axis="y", labelsize=8, colors="#555555")
+    ax.grid(color="#cccccc", lw=0.6)
+    ax.set_axisbelow(True)
+    ax.spines["polar"].set_color("#bbbbbb")
+    ax.legend(title="Kecepatan", loc="upper left", bbox_to_anchor=(1.08, 1.0), frameon=False, fontsize=9)
+    ax.set_title(judul, loc="center", fontsize=13, fontweight="bold", pad=28)
+    fig.text(0.5, 0.01, catatan, fontsize=8, color="#7f7f7f", ha="center", va="bottom", linespacing=1.5)
+    return _simpan_png(fig, plt)
+
+
+def _slug(teks: str) -> str:
+    import re
+    return re.sub(r"[^a-z0-9]+", "_", teks.lower()).strip("_")
+
+
+def _angka_id(x, desimal=2) -> str:
+    return f"{x:.{desimal}f}".replace(".", ",")
+
+
+def catatan_sumber(h, kolom: str) -> str:
+    """Baris sumber untuk gambar: dataset, grid yang dipakai, dan zona waktu."""
+    g = h.grid[0] if h.grid else None
+    asal = next((asl for kol, asl, _ in h.konversi if kol == kolom), "")
+    var = asal.split(",")[0].split("@")[0].strip()
+    for x in h.grid:
+        if var and var in [v.strip() for v in x.variabel.split(",")]:
+            g = x
+            break
+    teks = "Sumber: ERA5, Copernicus Climate Change Service."
+    if g is not None:
+        lat = f"{_angka_id(abs(g.lat_grid))}° {'LS' if g.lat_grid < 0 else 'LU'}"
+        lon = f"{_angka_id(abs(g.lon_grid))}° {'BB' if g.lon_grid < 0 else 'BT'}"
+        teks += f" Grid {lat}, {lon} ({_angka_id(g.jarak_km, 1)} km dari titik input)."
+    return teks + f" Waktu {h.zona.split(' ')[0]}."
 
 
 # --------------------------------------------------------------------------
@@ -1167,6 +1336,7 @@ def main():
             bar.empty()
             st.session_state["hasil"] = hasil
             st.session_state["xlsx"] = xlsx
+            st.session_state["proses_id"] = st.session_state.get("proses_id", 0) + 1
         except Exception as e:  # noqa: BLE001
             pesan = str(e)
             st.error(f"Gagal memproses file: {pesan}")
@@ -1210,69 +1380,128 @@ def main():
 
     nama_file = f"era5_{hasil.lat_input:.3f}_{hasil.lon_input:.3f}.xlsx".replace("-", "m")
 
-    # ---------------- Grafik deret waktu
-    angka = [c for c, j in hasil.jenis.items() if j not in ("teks", "arah")]
-    if angka:
-        st.subheader("Grafik deret waktu")
-        auto = resolusi_otomatis(hasil.data.index)
-        c1, c2 = st.columns([2, 1])
-        nama = c1.selectbox("Variabel", angka)
-        opsi = [f"Otomatis ({auto.lower()})"] + list(RESOLUSI)
-        pilih_res = c2.selectbox("Resolusi", opsi)
-        res = auto if pilih_res.startswith("Otomatis") else pilih_res
-
-        jenis = hasil.jenis[nama]
-        df = agregasi(hasil.data[nama], jenis, res)
-        if res == "Per jam" and len(df) > 20000:
-            st.caption(f"{len(df):,} titik per jam, grafik mungkin berat di browser.".replace(",", "."))
-        st.altair_chart(grafik_deret(df, nama, hasil.satuan[nama], jenis, res), width="stretch")
-
-        ket = []
-        if res != "Per jam":
-            ket.append("Garis: total per periode." if jenis == "jumlah"
-                       else "Garis: rata-rata per periode. Pita: rentang persentil 10-90 (80% data berada di dalamnya).")
-            kurang = df.loc[df["kelengkapan"] < 0.9, "label"].tolist()
-            if kurang:
-                daftar = ", ".join(kurang[:6]) + (f", dan {len(kurang) - 6} lainnya" if len(kurang) > 6 else "")
-                ket.append(f"Periode dengan data belum lengkap (ditandai segitiga/batang pucat): {daftar}.")
-        if ket:
-            st.caption(" ".join(ket))
-
-    # ---------------- Windrose
-    if hasil.angin:
-        st.subheader("Windrose")
-        idx = hasil.data.index
-        opsi_periode = (["Semua data"] + list(MUSIM) + NAMA_BULAN
-                        + [f"Tahun {t}" for t in sorted(set(idx.year))])
-        c1, c2, c3 = st.columns([2, 2, 1])
-        if len(hasil.angin) > 1:
-            pilih_angin = c1.selectbox("Ketinggian/level", [a["nama"] for a in hasil.angin])
+    # ---------------- Rentang data untuk grafik
+    pid = st.session_state.get("proses_id", 0)
+    idx_semua = hasil.data.index
+    st.subheader("Grafik")
+    with st.container(border=True):
+        cara = st.radio("Pilih rentang data berdasarkan", ["Bulan", "Tanggal"], horizontal=True, key=f"cara_{pid}")
+        c1, c2 = st.columns(2)
+        if cara == "Bulan":
+            daftar_bulan = pd.period_range(idx_semua.min().to_period("M"), idx_semua.max().to_period("M"), freq="M")
+            label = [label_bulan(p.start_time) for p in daftar_bulan]
+            dari = c1.selectbox("Dari bulan", label, index=0, key=f"dari_{pid}")
+            sampai = c2.selectbox("Sampai bulan", label, index=len(label) - 1, key=f"sampai_{pid}")
+            i0, i1 = sorted((label.index(dari), label.index(sampai)))
+            mulai, akhir = daftar_bulan[i0].start_time, daftar_bulan[i1].end_time
+            teks_rentang = label[i0] if i0 == i1 else f"{label[i0]} s.d. {label[i1]}"
         else:
-            pilih_angin = hasil.angin[0]["nama"]
-            c1.text_input("Ketinggian/level", pilih_angin, disabled=True)
-        a = next(x for x in hasil.angin if x["nama"] == pilih_angin)
-        periode = c2.selectbox("Periode", opsi_periode,
-                               help="Musim mengikuti pembagian DJF/MAM/JJA/SON. Bulan dan tahun memakai zona waktu yang dipilih.")
-        n_sektor = c3.radio("Sektor", [16, 8], horizontal=True)
+            awal_d, akhir_d = idx_semua.min().date(), idx_semua.max().date()
+            pilih_tgl = c1.date_input("Rentang tanggal", value=(awal_d, akhir_d), min_value=awal_d,
+                                      max_value=akhir_d, format="DD/MM/YYYY", key=f"tgl_{pid}")
+            if isinstance(pilih_tgl, (tuple, list)):
+                d0 = pilih_tgl[0]
+                d1 = pilih_tgl[1] if len(pilih_tgl) > 1 else pilih_tgl[0]
+            else:
+                d0 = d1 = pilih_tgl
+            mulai = pd.Timestamp(d0)
+            akhir = pd.Timestamp(d1) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+            teks_rentang = (label_tanggal(mulai) if d0 == d1
+                            else f"{label_tanggal(mulai)} s.d. {label_tanggal(pd.Timestamp(d1))}")
+        mask_rentang = saring_rentang(idx_semua, mulai, akhir)
+        data = hasil.data[mask_rentang]
+        st.caption(f"{len(data):,} data dalam rentang {teks_rentang}. ".replace(",", ".")
+                   + "Rentang ini dipakai untuk grafik deret waktu dan windrose; file Excel tetap berisi seluruh data.")
 
-        mask = saring_periode(idx, periode)
-        tabel, tenang, n = tabel_windrose(hasil.data.loc[mask, a["kec"]], hasil.data.loc[mask, a["arah"]], n_sektor)
-        if n == 0:
-            st.info("Tidak ada data angin pada periode ini.")
-        else:
-            judul = f"Windrose {a['nama']}, {periode.lower() if periode == 'Semua data' else periode}"
-            st.plotly_chart(gambar_windrose(tabel, judul), width="stretch")
-            per_arah = tabel.sum(axis=1)
-            kec_rata = hasil.data.loc[mask, a["kec"]].mean()
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Arah dominan", per_arah.idxmax(), f"{per_arah.max():.1f}% kejadian", delta_color="off")
-            m2.metric("Kecepatan rata-rata", f"{kec_rata:.2f} m/s")
-            m3.metric("Angin tenang (< 0,5 m/s)", f"{tenang:.1f}%")
-            m4.metric("Jumlah data", f"{n:,}".replace(",", "."))
-            st.caption("Arah menunjukkan dari mana angin datang. Panjang batang = persentase kejadian dari seluruh "
-                       "data di periode ini; angin tenang tidak punya arah sehingga tidak masuk batang. "
-                       "Gambar bisa disimpan lewat ikon kamera di pojok kanan atas grafik. "
-                       "Tabel windrose lengkap ada di sheet Windrose pada file Excel.")
+    if data.empty:
+        st.info("Tidak ada data pada rentang ini.")
+    else:
+        png_deret_c = st.cache_data(show_spinner=False)(png_deret)
+        png_windrose_c = st.cache_data(show_spinner=False)(png_windrose)
+        slug_rentang = _slug(teks_rentang)
+
+        # ---------------- Grafik deret waktu
+        angka = [c for c, j in hasil.jenis.items() if j not in ("teks", "arah")]
+        if angka:
+            st.markdown("#### Deret waktu")
+            auto = resolusi_otomatis(data.index)
+            c1, c2 = st.columns([2, 1])
+            nama = c1.selectbox("Variabel", angka, key=f"var_{pid}")
+            pilih_res = c2.selectbox("Resolusi", ["Otomatis"] + list(RESOLUSI), key=f"res_{pid}",
+                                     help="Otomatis: per jam sampai 7 hari, per hari sampai 4 bulan, "
+                                          "per bulan sampai 3 tahun, per tahun untuk rentang lebih panjang.")
+            res = auto if pilih_res == "Otomatis" else pilih_res
+
+            jenis = hasil.jenis[nama]
+            df = agregasi(data[nama], jenis, res)
+            if df.empty:
+                st.info("Variabel ini tidak punya data pada rentang yang dipilih.")
+            else:
+                if res == "Per jam" and len(df) > 20000:
+                    st.caption(f"{len(df):,} titik per jam, grafik mungkin berat di browser.".replace(",", "."))
+                st.altair_chart(grafik_deret(df, nama, hasil.satuan[nama], jenis, res), width="stretch")
+
+                ket = [f"Ditampilkan {res.lower()}" + (" (otomatis)." if pilih_res == "Otomatis" else ".")]
+                if res != "Per jam":
+                    ket.append("Garis: total per periode." if jenis == "jumlah"
+                               else "Garis: rata-rata per periode. Pita: rentang persentil 10-90 (80% data berada di dalamnya).")
+                    kurang = df.loc[df["kelengkapan"] < 0.9, "label"].tolist()
+                    if kurang:
+                        daftar = ", ".join(kurang[:6]) + (f", dan {len(kurang) - 6} lainnya" if len(kurang) > 6 else "")
+                        ket.append(f"Periode dengan data belum lengkap (ditandai segitiga/batang pucat): {daftar}.")
+                if ket:
+                    st.caption(" ".join(ket))
+
+                judul = f"{nama.split(' (')[0]}, {teks_rentang} ({res.lower()})"
+                png = png_deret_c(df, nama, hasil.satuan[nama], jenis, res, judul,
+                                  catatan_sumber(hasil, nama))
+                st.download_button("Unduh grafik (PNG)", png, key=f"dl_grafik_{pid}",
+                                   file_name=f"grafik_{_slug(nama.split(' (')[0])}_{slug_rentang}_{_slug(res)}.png",
+                                   mime="image/png")
+
+        # ---------------- Windrose
+        if hasil.angin:
+            st.markdown("#### Windrose")
+            c1, c2, c3 = st.columns([2, 2, 1])
+            if len(hasil.angin) > 1:
+                pilih_angin = c1.selectbox("Ketinggian/level", [a["nama"] for a in hasil.angin], key=f"lvl_{pid}")
+            else:
+                pilih_angin = hasil.angin[0]["nama"]
+                c1.text_input("Ketinggian/level", pilih_angin, disabled=True, key=f"lvl_{pid}")
+            a = next(x for x in hasil.angin if x["nama"] == pilih_angin)
+            semua = "Semua bulan dalam rentang"
+            periode = c2.selectbox("Saring lagi (opsional)", [semua] + list(MUSIM) + NAMA_BULAN, key=f"musim_{pid}",
+                                   help="Contoh: rentang 2021 s.d. 2025 lalu pilih JJA untuk melihat angin musim kemarau "
+                                        "selama lima tahun itu.")
+            n_sektor = c3.radio("Sektor", [16, 8], horizontal=True, key=f"sektor_{pid}")
+
+            mask = saring_periode(data.index, periode)
+            sub = data.loc[mask]
+            tabel, tenang, n = tabel_windrose(sub[a["kec"]], sub[a["arah"]], n_sektor)
+            if n == 0:
+                st.info("Tidak ada data angin pada pilihan ini. Cek lagi isian \"Saring lagi\", misalnya bulan yang dipilih tidak ada dalam rentang.")
+            else:
+                keterangan = teks_rentang if periode == semua else f"{teks_rentang}, {periode}"
+                st.plotly_chart(gambar_windrose(tabel, f"Windrose {a['nama']}, {keterangan}"), width="stretch")
+                per_arah = tabel.sum(axis=1)
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Arah dominan", per_arah.idxmax(), f"{per_arah.max():.1f}% kejadian", delta_color="off")
+                m2.metric("Kecepatan rata-rata", f"{sub[a['kec']].mean():.2f} m/s")
+                m3.metric("Angin tenang (< 0,5 m/s)", f"{tenang:.1f}%")
+                m4.metric("Jumlah data", f"{n:,}".replace(",", "."))
+                st.caption("Arah menunjukkan dari mana angin datang. Panjang batang = persentase kejadian dari seluruh "
+                           "data pada pilihan ini; angin tenang tidak punya arah sehingga tidak masuk batang. "
+                           "Tabel windrose seluruh data ada di sheet Windrose pada file Excel.")
+
+                jumlah = f"{n:,}".replace(",", ".")
+                catatan = (catatan_sumber(hasil, a["kec"]) + "\n"
+                           + f"Angin tenang (< 0,5 m/s): {_angka_id(tenang, 1)}%. Jumlah data: {jumlah}. "
+                           + "Arah = arah datangnya angin.")
+                png = png_windrose_c(tabel, f"Windrose {a['nama']}\n{keterangan}", catatan)
+                st.download_button("Unduh windrose (PNG)", png, key=f"dl_wr_{pid}",
+                                   file_name=f"windrose_{_slug(a['nama'])}_{slug_rentang}"
+                                             + ("" if periode == semua else f"_{_slug(periode)}") + f"_{n_sektor}arah.png",
+                                   mime="image/png")
 
     st.subheader("Pratinjau data")
     st.dataframe(hasil.data.head(500), width="stretch")
