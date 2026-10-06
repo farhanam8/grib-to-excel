@@ -991,7 +991,13 @@ def tabel_windrose(kec: pd.Series, arah: pd.Series, n_sektor=16):
     return tabel, tenang, total
 
 
-def gambar_windrose(tabel: pd.DataFrame, judul=""):
+def putar_ke_tujuan(tabel: pd.DataFrame) -> pd.DataFrame:
+    """Ubah tabel 'datang dari' menjadi 'bertiup ke': angin dari S masuk ke baris U, dst."""
+    n = len(tabel)
+    return pd.DataFrame(np.roll(tabel.values, n // 2, axis=0), index=tabel.index, columns=tabel.columns)
+
+
+def gambar_windrose(tabel: pd.DataFrame, judul="", tenang=None):
     import plotly.graph_objects as go
 
     n = len(tabel)
@@ -1005,14 +1011,19 @@ def gambar_windrose(tabel: pd.DataFrame, judul=""):
             name=f"{nama} m/s", marker_color=warna, marker_line_width=0,
             customdata=tabel.index,
             hovertemplate="%{customdata}: %{r:.2f}%<extra>" + nama + " m/s</extra>"))
+    if tenang is not None:
+        fig.add_trace(go.Barpolar(r=[0], theta=[0], name=f"Tenang (< 0,5 m/s): {_angka_id(tenang, 1)}%",
+                                  marker_color="rgba(0,0,0,0)", hoverinfo="skip"))
     fig.update_layout(
-        title=judul, height=520, margin=dict(t=60, b=30, l=30, r=30),
+        title=judul, height=560, margin=dict(t=60, b=30, l=30, r=30),
         legend=dict(title="Kecepatan", orientation="v"),
         polar=dict(
             bargap=0,
             angularaxis=dict(direction="clockwise", rotation=90, tickmode="array",
                              tickvals=sudut, ticktext=list(tabel.index)),
-            radialaxis=dict(ticksuffix="%", angle=90, tickangle=90),
+            radialaxis=dict(ticksuffix="%", angle=90 - 180 / n, tickangle=90 - 180 / n,
+                            tickfont=dict(size=10, color="#444444")),
+            bgcolor="white",
         ),
     )
     return fig
@@ -1125,7 +1136,7 @@ def png_deret(df: pd.DataFrame, nama: str, satuan: str, jenis: str, resolusi: st
     return _simpan_png(fig, plt)
 
 
-def png_windrose(tabel: pd.DataFrame, judul: str, catatan: str) -> bytes:
+def png_windrose(tabel: pd.DataFrame, judul: str, catatan: str, tenang=None) -> bytes:
     """Versi gambar (PNG, latar putih) dari windrose."""
     plt = _gaya_mpl()
     from matplotlib.ticker import FuncFormatter, MaxNLocator
@@ -1153,7 +1164,13 @@ def png_windrose(tabel: pd.DataFrame, judul: str, catatan: str) -> bytes:
     ax.grid(color="#cccccc", lw=0.6)
     ax.set_axisbelow(True)
     ax.spines["polar"].set_color("#bbbbbb")
-    ax.legend(title="Kecepatan", loc="upper left", bbox_to_anchor=(1.08, 1.0), frameon=False, fontsize=9)
+    pegangan, label = ax.get_legend_handles_labels()
+    if tenang is not None:
+        from matplotlib.patches import Patch
+        pegangan.append(Patch(fc="none", ec="none"))
+        label.append(f"Tenang (< 0,5 m/s): {_angka_id(tenang, 1)}%")
+    ax.legend(pegangan, label, title="Kecepatan", loc="upper left", bbox_to_anchor=(1.08, 1.0), frameon=False,
+              fontsize=9)
     ax.set_title(judul, loc="center", fontsize=13, fontweight="bold", pad=28)
     fig.text(0.5, 0.01, catatan, fontsize=8, color="#7f7f7f", ha="center", va="bottom", linespacing=1.5)
     return _simpan_png(fig, plt)
@@ -1989,7 +2006,7 @@ def main():
         # ---------------- Windrose
         if hasil.angin:
             st.markdown("#### Windrose")
-            c1, c2, c3 = st.columns([2, 2, 1])
+            c1, c2, c3, c4 = st.columns([2, 2, 1, 2])
             if len(hasil.angin) > 1:
                 pilih_angin = c1.selectbox("Ketinggian/level", [a["nama"] for a in hasil.angin], key=f"lvl_{pid}")
             else:
@@ -2001,6 +2018,12 @@ def main():
                                    help="Contoh: rentang 2021 s.d. 2025 lalu pilih JJA untuk melihat angin musim kemarau "
                                         "selama lima tahun itu.")
             n_sektor = c3.radio("Sektor", [16, 8], horizontal=True, key=f"sektor_{pid}")
+            tampil = c4.radio("Kelopak menunjukkan", ["Arah datang angin", "Arah tujuan angin"],
+                              key=f"tujuan_{pid}",
+                              help="Standar windrose (WMO, WRPLOT bawaan) memakai arah datang: kelopak di utara "
+                                   "berarti angin bertiup DARI utara. Arah tujuan memutar semua kelopak 180°.")
+            tujuan = tampil == "Arah tujuan angin"
+            istilah = "arah tujuan" if tujuan else "arah datang"
 
             mask = saring_periode(data.index, periode)
             sub = data.loc[mask]
@@ -2009,9 +2032,12 @@ def main():
                 st.info("Tidak ada data angin pada pilihan ini. Cek lagi isian \"Saring lagi\", misalnya bulan yang dipilih tidak ada dalam rentang.")
             else:
                 keterangan = teks_rentang if periode == semua else f"{teks_rentang}, {periode}"
+                tabel_tampil = putar_ke_tujuan(tabel) if tujuan else tabel
                 per_arah = tabel.sum(axis=1)
+                dominan = per_arah.idxmax()
+                ke = tabel.index[(list(tabel.index).index(dominan) + len(tabel) // 2) % len(tabel)]
                 m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Arah dominan (datang dari)", per_arah.idxmax(), f"{per_arah.max():.1f}% kejadian",
+                m1.metric("Arah dominan", f"dari {dominan}, ke {ke}", f"{per_arah.max():.1f}% kejadian",
                           delta_color="off")
                 m2.metric("Kecepatan rata-rata", f"{sub[a['kec']].mean():.2f} m/s")
                 m3.metric("Angin tenang (< 0,5 m/s)", f"{tenang:.1f}%")
@@ -2022,27 +2048,28 @@ def main():
                 tab_diagram, tab_peta = st.tabs(["Diagram", "Di atas peta"])
 
                 with tab_diagram:
-                    st.plotly_chart(gambar_windrose(tabel, f"Windrose {a['nama']}, {keterangan}"), width="stretch")
-                    st.caption("Arah menunjukkan dari mana angin datang. Panjang batang = persentase kejadian dari "
-                               "seluruh data pada pilihan ini; angin tenang tidak punya arah sehingga tidak masuk "
-                               "batang. Tabel windrose seluruh data ada di sheet Windrose pada file Excel.")
-                    catatan = catatan_sumber(hasil, a["kec"]) + "\n" + ringkas + " Arah = arah datangnya angin."
-                    judul_wr = f"Windrose {a['nama']}\n{keterangan}"
-                    png = lambda: png_windrose_c(tabel, judul_wr, catatan)  # noqa: E731
+                    st.plotly_chart(gambar_windrose(tabel_tampil, f"Windrose {a['nama']} ({istilah}), {keterangan}",
+                                                    tenang), width="stretch")
+                    st.caption(
+                        ("Kelopak menunjuk ke arah angin bertiup (arah tujuan). " if tujuan
+                         else "Kelopak menunjuk ke arah datangnya angin (standar windrose). ")
+                        + "Panjang batang = persentase kejadian dari seluruh data pada pilihan ini, termasuk angin "
+                          "tenang; angin tenang tidak punya arah sehingga tidak masuk batang. Tabel windrose "
+                          "(arah datang) ada di sheet Windrose pada file Excel.")
+                    catatan = (catatan_sumber(hasil, a["kec"]) + "\n" + ringkas
+                               + (" Kelopak = arah tujuan angin (ke mana angin bertiup)." if tujuan
+                                  else " Kelopak = arah datang angin."))
+                    judul_wr = f"Windrose {a['nama']} ({istilah})\n{keterangan}"
+                    png = lambda: png_windrose_c(tabel_tampil, judul_wr, catatan, tenang)  # noqa: E731
                     st.download_button("Unduh windrose (PNG)", png, key=f"dl_wr_{pid}",
                                        file_name=f"windrose_{_slug(a['nama'])}_{slug_rentang}"
                                                  + ("" if periode == semua else f"_{_slug(periode)}")
-                                                 + f"_{n_sektor}arah.png",
+                                                 + f"_{n_sektor}arah" + ("_tujuan" if tujuan else "_datang") + ".png",
                                        mime="image/png")
 
                 with tab_peta:
                     g = grid_untuk(hasil, a["kec"])
-                    c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
-                    tampil = c1.radio("Kelopak menunjukkan", ["Arah datang angin", "Arah tujuan angin"],
-                                      key=f"tujuan_{pid}",
-                                      help="Windrose standar menunjukkan dari mana angin datang. Pilih arah tujuan "
-                                           "untuk melihat ke mana angin bertiup dari titik ini.")
-                    tujuan = tampil == "Arah tujuan angin"
+                    c2, c3, c4 = st.columns([2, 2, 2])
                     peta_dasar = c2.radio("Peta dasar", list(PETA_DASAR), key=f"basemap_{pid}")
                     radius = c3.slider("Panjang kelopak terpanjang (km)", 2, 200, 30, key=f"radius_{pid}",
                                        help="Hanya skala gambar. Panjang kelopak sebanding dengan persentase "
@@ -2053,8 +2080,6 @@ def main():
                         gambar_windrose_peta(tabel, hasil.lat_input, hasil.lon_input, g.lat_grid, g.lon_grid,
                                              radius, tujuan, peta_dasar, opasitas=opasitas),
                         width="stretch")
-                    dominan = per_arah.idxmax()
-                    ke = tabel.index[(list(tabel.index).index(dominan) + len(tabel) // 2) % len(tabel)]
                     st.caption(
                         ("Kelopak menunjuk ke arah angin bertiup. " if tujuan
                          else "Kelopak menunjuk ke arah datangnya angin (standar windrose). ")
@@ -2068,7 +2093,7 @@ def main():
                                   else "Kelopak menunjukkan arah datang angin. ")
                                + ringkas)
                     def png_peta(tabel=tabel, g=g, radius=radius, tujuan=tujuan, peta_dasar=peta_dasar,
-                                 judul=f"Windrose {a['nama']}\n{keterangan}", catatan=catatan, opasitas=opasitas):
+                                 judul=f"Windrose {a['nama']} ({istilah})\n{keterangan}", catatan=catatan, opasitas=opasitas):
                         return png_windrose_peta_c(tabel, hasil.lat_input, hasil.lon_input, g.lat_grid,
                                                    g.lon_grid, radius, tujuan, peta_dasar, judul, catatan, opasitas)
                     st.download_button("Unduh windrose di peta (PNG)", png_peta, key=f"dl_wrp_{pid}",
